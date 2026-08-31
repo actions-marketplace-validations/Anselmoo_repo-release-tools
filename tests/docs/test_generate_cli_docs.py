@@ -1,0 +1,1433 @@
+from __future__ import annotations
+
+import argparse
+import importlib
+import io
+import os
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+
+def _load_generator_module() -> Any:
+    """Return a freshly-reloaded docs_publisher module for test isolation."""
+    import repo_release_tools.docs.publisher as pub
+
+    importlib.reload(pub)
+    return pub
+
+
+def _assert_frontmatter_and_h1(rendered: str, *, title: str) -> None:
+    assert rendered.startswith("---\n")
+    assert f'title: "{title}"' in rendered
+    assert f"\n# {title}\n" in rendered
+
+
+def test_iter_help_sections_covers_root_commands_and_nested_subcommands() -> None:
+    docs = _load_generator_module()
+
+    sections = list(docs.iter_help_sections())
+    argvs = [section.argv for section in sections]
+
+    assert argvs[0] == ()
+    assert ("branch",) in argvs
+    assert ("branch", "new") in argvs
+    assert ("git", "diff") in argvs
+    assert ("ci-version", "compute") in argvs
+    assert ("skill", "install") in argvs
+
+
+def test_generate_markdown_has_stable_sections_without_ansi_sequences() -> None:
+    docs = _load_generator_module()
+
+    content = docs.generate_markdown()
+
+    # Compact index: has H1, global help, command-group table, no per-command argparse blocks
+    assert content.startswith("# rrt CLI\n")
+    assert "## Global help" in content
+    assert "## Command reference" in content
+    assert "Version & Release" in content
+    assert "Repository Health" in content
+    assert "Git Workflow" in content
+    assert "/repo-release-tools/commands/version-release/" in content
+    assert "/repo-release-tools/commands/repo-health/" in content
+    # Per-command sections are no longer in the compact index (they live in group pages)
+    assert "### `rrt branch new`" not in content
+    assert "RRT CLI" not in content
+    assert "\x1b[" not in content
+
+
+def test_generate_group_reference_markdown_contains_per_command_sections() -> None:
+    docs = _load_generator_module()
+
+    content = docs.generate_group_reference_markdown("Git Workflow", ("branch", "git"))
+
+    assert content.startswith("# rrt Git Workflow\n")
+    assert "## `rrt branch`" in content
+    assert "### `rrt branch new`" in content
+    assert "## `rrt git`" in content
+    assert "### `rrt git diff`" in content
+    assert "\x1b[" not in content
+
+
+def test_generate_markdown_uses_mdx_comments_for_mdx_output_path() -> None:
+    docs = _load_generator_module()
+
+    content = docs.generate_markdown(Path("docs/src/content/docs/commands/rrt-cli.mdx"))
+
+    assert "{/* Auto-generated from repo_release_tools.cli.build_parser();" in content
+    assert "{/* rrt:auto:start:toc */}" in content
+    assert "{/* rrt:auto:end:toc */}" in content
+    assert "<!--" not in content
+
+
+def test_generate_markdown_uses_html_comments_for_md_output_path() -> None:
+    docs = _load_generator_module()
+
+    content = docs.generate_markdown(Path("docs/commands/rrt-cli.md"))
+
+    assert "<!-- Auto-generated from repo_release_tools.cli.build_parser();" in content
+    assert "<!-- rrt:auto:start:toc -->" in content
+    assert "<!-- rrt:auto:end:toc -->" in content
+    assert "{/*" not in content
+
+
+def test_generate_group_reference_markdown_uses_mdx_comments_for_mdx_output_path() -> None:
+    docs = _load_generator_module()
+
+    content = docs.generate_group_reference_markdown(
+        "Git Workflow",
+        ("branch", "git"),
+        Path("docs/src/content/docs/commands/git-workflow.mdx"),
+    )
+
+    assert "{/* Auto-generated from repo_release_tools.cli.build_parser();" in content
+    assert "{/* rrt:auto:start:toc */}" in content
+    assert "{/* rrt:auto:end:toc */}" in content
+    assert "<!--" not in content
+
+
+def test_generate_group_reference_markdown_uses_html_comments_for_md_output_path() -> None:
+    docs = _load_generator_module()
+
+    content = docs.generate_group_reference_markdown(
+        "Git Workflow", ("branch", "git"), Path("docs/commands/git-workflow.md")
+    )
+
+    assert "<!-- Auto-generated from repo_release_tools.cli.build_parser();" in content
+    assert "<!-- rrt:auto:start:toc -->" in content
+    assert "<!-- rrt:auto:end:toc -->" in content
+    assert "{/*" not in content
+
+
+def test_autogen_note_and_anchor_stub_pair_are_format_aware() -> None:
+    docs = _load_generator_module()
+
+    assert docs._autogen_note(Path("a.mdx")).startswith("{/* Auto-generated")
+    assert docs._autogen_note(Path("a.md")).startswith("<!-- Auto-generated")
+
+    mdx_start, mdx_end = docs._anchor_stub_pair("toc", Path("a.mdx"))
+    assert mdx_start == "{/* rrt:auto:start:toc */}"
+    assert mdx_end == "{/* rrt:auto:end:toc */}"
+
+    md_start, md_end = docs._anchor_stub_pair("toc", Path("a.md"))
+    assert md_start == "<!-- rrt:auto:start:toc -->"
+    assert md_end == "<!-- rrt:auto:end:toc -->"
+
+
+def test_render_command_docs_only_for_top_level_commands() -> None:
+    docs = _load_generator_module()
+
+    class DummyModule:
+        __doc__ = "# Overview\n\nParagraph.\n\n## Details\n\nMore."
+
+    docs.COMMAND_DOC_MODULES = {"branch": DummyModule}
+    docs.COMMAND_DOC_SOURCES = {}
+
+    rendered = docs.render_command_docs(("branch",), heading_level=2)
+
+    assert rendered == "### Overview\n\nParagraph.\n\n#### Details\n\nMore."
+    assert docs.render_command_docs((), heading_level=2) == ""
+    assert docs.render_command_docs(("branch", "new"), heading_level=3) == ""
+
+
+def test_render_command_docs_prefers_source_owned_topic_docs_for_branch_and_git() -> None:
+    docs = _load_generator_module()
+
+    branch_rendered = docs.render_command_docs(("branch",), heading_level=2)
+    git_rendered = docs.render_command_docs(("git",), heading_level=2)
+
+    assert "conventional branches" in branch_rendered
+    assert "rrt git" in git_rendered
+    assert "branch helpers for repo-release-tools" not in branch_rendered
+    assert "Git helpers for repo-release-tools" not in git_rendered
+
+
+def test_generate_group_reference_markdown_places_help_in_code_block() -> None:
+    docs = _load_generator_module()
+    docs.iter_help_sections_for_commands = lambda commands: iter(
+        [docs.HelpSection(argv=("branch",), heading_level=2)]
+    )
+    docs.render_help = lambda argv: "Usage: rrt branch"
+
+    content = docs.generate_group_reference_markdown("Git Workflow", ("branch",))
+
+    assert "## `rrt branch`" in content
+    assert "```text\nUsage: rrt branch\n```" in content
+    # Prose from COMMAND_DOC_SOURCES["branch"] must appear between the heading and the code block
+    heading_end = content.index("## `rrt branch`\n") + len("## `rrt branch`\n")
+    code_start = content.index("```text")
+    assert content[heading_end:code_start].strip(), "no prose injected before code block"
+
+
+def test_render_command_docs_returns_empty_for_unknown_command() -> None:
+    docs = _load_generator_module()
+    docs.COMMAND_DOC_MODULES = None
+    docs.COMMAND_DOC_SOURCES = {}
+
+    # A command not in the registry returns "" and exercises the module-not-found branch
+    result = docs.render_command_docs(("nonexistent-cmd",), heading_level=2)
+
+    assert result == ""
+
+
+def test_render_command_docs_uses_get_command_doc_modules_when_sentinel_is_none() -> None:
+    docs = _load_generator_module()
+    docs.COMMAND_DOC_MODULES = None
+    docs.COMMAND_DOC_SOURCES = {}
+
+    # "toc" is in _get_command_doc_modules() but not in COMMAND_DOC_SOURCES
+    result = docs.render_command_docs(("toc",), heading_level=2)
+
+    # toc module has a docstring, so result should be non-empty or at least not raise
+    assert isinstance(result, str)
+
+
+def test_iter_help_sections_for_commands_returns_nothing_for_unknown_command() -> None:
+    docs = _load_generator_module()
+
+    sections = list(docs.iter_help_sections_for_commands(["__not_a_real_rrt_command__"]))
+
+    assert sections == []
+
+
+def test_iter_help_sections_for_commands_stops_when_no_subparsers() -> None:
+    docs = _load_generator_module()
+    docs._find_subparsers_action = lambda _parser: None
+
+    sections = list(docs.iter_help_sections_for_commands(["branch"]))
+
+    assert sections == []
+
+
+def test_heading_level_rejects_invalid_heading_variants() -> None:
+    docs = _load_generator_module()
+
+    assert docs._heading_level("####### Too many") is None
+    assert docs._heading_level("###No space") is None
+
+
+def test_normalize_markdown_headings_returns_trimmed_text_without_headings() -> None:
+    docs = _load_generator_module()
+
+    text = "plain text\n\n```python\n# fenced heading\n```\n"
+
+    assert docs._normalize_markdown_headings(text, min_level=2) == text.strip()
+
+
+def test_normalize_markdown_headings_leaves_already_nested_headings_unchanged() -> None:
+    docs = _load_generator_module()
+
+    text = "## Title\n\nBody\n"
+
+    assert docs._normalize_markdown_headings(text, min_level=2) == text.strip()
+
+
+def test_render_command_docs_returns_empty_for_blank_docstring() -> None:
+    docs = _load_generator_module()
+
+    class BlankModule:
+        __doc__ = "   "
+
+    docs.COMMAND_DOC_SOURCES = {}
+    docs.COMMAND_DOC_MODULES = {"branch": BlankModule}
+
+    assert docs.render_command_docs(("branch",), heading_level=2) == ""
+
+
+def test_resolve_parser_raises_for_unknown_parser_path() -> None:
+    docs = _load_generator_module()
+
+    with pytest.raises(KeyError, match="unknown parser path"):
+        docs._resolve_parser(("branch", "missing"))
+
+
+def test_iter_help_sections_without_subparsers_yields_root_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    docs = _load_generator_module()
+
+    monkeypatch.setattr(
+        "repo_release_tools.cli.build_parser",
+        lambda: __import__("argparse").ArgumentParser(),
+    )
+
+    sections = list(docs.iter_help_sections())
+    assert sections == [docs.HelpSection(argv=(), heading_level=2)]
+
+
+def test_pinned_help_environment_restores_existing_variables(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    docs = _load_generator_module()
+
+    monkeypatch.setenv("COLUMNS", "99")
+    monkeypatch.setenv("NO_COLOR", "0")
+
+    with docs.pinned_help_environment():
+        assert os.environ["COLUMNS"] == docs.PINNED_COLUMNS
+        assert os.environ["NO_COLOR"] == "1"
+
+    assert os.environ["COLUMNS"] == "99"
+    assert os.environ["NO_COLOR"] == "0"
+
+
+def test_pinned_help_environment_restores_missing_no_color(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    docs = _load_generator_module()
+
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.setenv("COLUMNS", "99")
+
+    with docs.pinned_help_environment():
+        assert os.environ["COLUMNS"] == docs.PINNED_COLUMNS
+        assert os.environ["NO_COLOR"] == "1"
+
+    assert os.environ["COLUMNS"] == "99"
+    assert "NO_COLOR" not in os.environ
+
+
+def test_generate_index_topic_links_markdown_lists_expected_entries() -> None:
+    docs = _load_generator_module()
+
+    content = docs.generate_index_topic_links_markdown()
+
+    assert "/repo-release-tools/commands/branch/" in content
+    assert "/repo-release-tools/commands/git_cmd/" in content
+    assert "/repo-release-tools/commands/tree/" in content
+    assert "/repo-release-tools/mcp-server/" in content
+
+
+def test_generate_readme_links_markdown_includes_mcp_server_doc() -> None:
+    docs = _load_generator_module()
+
+    content = docs.generate_readme_links_markdown()
+
+    assert "https://anselmoo.github.io/repo-release-tools/mcp-server/" in content
+
+
+def test_iter_generated_doc_targets_exposes_all_targets() -> None:
+    docs = _load_generator_module()
+
+    targets = list(docs.iter_generated_doc_targets())
+
+    assert targets
+    assert targets[0].output_path.name == "rrt-cli.mdx"
+    assert any(target.anchor_id == "index-topic-links" for target in targets)
+    assert any(target.anchor_id == "readme-links" for target in targets)
+
+
+def test_topic_doc_generators_use_source_owned_markdown_constants() -> None:
+    docs = _load_generator_module()
+
+    assert docs.generate_semantic_branches_markdown() == docs.branch_module.SEMANTIC_BRANCHES_DOC
+    assert docs.generate_git_markdown() == docs.git_helpers.GIT_DOC
+    assert docs.generate_semantic_branches_markdown().startswith("# rrt branch")
+    assert docs.generate_git_markdown().startswith("# rrt git")
+    assert docs.GENERATED_DOC_TARGETS[0].output_path.name == "rrt-cli.mdx"
+    assert len(docs.GENERATED_DOC_TARGETS) >= 3
+    assert "branch" in docs.TOPIC_PAGE_OUTPUTS
+    assert "git" in docs.TOPIC_PAGE_OUTPUTS
+
+
+def test_generated_doc_targets_include_anchored_index_block() -> None:
+    docs = _load_generator_module()
+
+    index_targets = [
+        target
+        for target in docs.GENERATED_DOC_TARGETS
+        if str(target.output_path).endswith("docs/src/content/docs/index.mdx")
+    ]
+
+    assert len(index_targets) == 1
+    assert index_targets[0].anchor_id == "index-topic-links"
+    assert not index_targets[0].render().startswith("---\n")
+
+
+def test_generated_doc_targets_include_anchored_readme_links_block() -> None:
+    docs = _load_generator_module()
+
+    readme_targets = [
+        target for target in docs.GENERATED_DOC_TARGETS if str(target.output_path) == "README.md"
+    ]
+
+    assert len(readme_targets) == 1
+    assert readme_targets[0].anchor_id == "readme-links"
+
+
+def test_generated_command_topics_have_frontmatter_and_command_h1() -> None:
+    docs = _load_generator_module()
+
+    by_name = {target.output_path.name: target for target in docs.GENERATED_DOC_TARGETS}
+
+    doctor = by_name["doctor.mdx"].render()
+    eol = by_name["eol_check.mdx"].render()
+    git_doc = by_name["git_cmd.mdx"].render()
+
+    _assert_frontmatter_and_h1(doctor, title="rrt doctor")
+    _assert_frontmatter_and_h1(eol, title="rrt eol")
+    _assert_frontmatter_and_h1(git_doc, title="rrt git")
+
+
+def test_validate_generated_pages_returns_no_issues_for_current_registry() -> None:
+    docs = _load_generator_module()
+
+    assert docs.validate_generated_pages() == []
+
+
+def test_get_command_doc_modules_covers_all_group_page_commands() -> None:
+    docs = _load_generator_module()
+
+    modules = docs._get_command_doc_modules()
+    registered = set(modules.keys()) | set(docs.COMMAND_DOC_SOURCES.keys())
+
+    all_group_commands = {cmd for _, _, commands in docs.COMMAND_GROUPS_CONFIG for cmd in commands}
+
+    missing = all_group_commands - registered
+    assert not missing, f"Commands missing from doc registry: {missing}"
+
+
+def test_generate_group_reference_markdown_includes_docstring_prose() -> None:
+    docs = _load_generator_module()
+
+    content = docs.generate_group_reference_markdown("Git Workflow", ("branch", "git"))
+
+    # branch and git both have prose docs — verify they appear before their code blocks
+    assert "```text" in content
+    # Each top-level command section should have prose between its heading and code block
+    branch_heading = "## `rrt branch`\n"
+    assert branch_heading in content
+    branch_end = content.index(branch_heading) + len(branch_heading)
+    # Find the next code block after the branch heading
+    next_code = content.index("```text", branch_end)
+    between = content[branch_end:next_code].strip()
+    assert between, "no prose injected for rrt branch"
+
+
+def test_extract_first_h1_helper() -> None:
+    docs = _load_generator_module()
+
+    assert docs._extract_first_h1("# Title\n\nBody\n") == "Title"
+    assert docs._extract_first_h1("No heading here\n") is None
+
+
+def test_cmd_publish_renders_each_target_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    docs = _load_generator_module()
+    from repo_release_tools.commands import docs_cmd
+
+    calls: list[str] = []
+
+    class FakeTarget:
+        def __init__(self, name: str) -> None:
+            self.output_path = Path(f"docs/commands/{name}.md")
+            self.anchor_id = None
+            self.name = name
+            self.render_calls = 0
+
+        def render(self) -> str:
+            self.render_calls += 1
+            return f'---\ntitle: "{self.name}"\n---\n\n# {self.name}\n'
+
+    targets = [FakeTarget("alpha"), FakeTarget("beta")]
+
+    monkeypatch.setattr(docs, "iter_generated_doc_targets", lambda: iter(targets))
+    monkeypatch.setattr(docs, "validate_generated_page", lambda target, rendered: [])
+    monkeypatch.setattr(
+        docs_cmd,
+        "apply_generated_docs",
+        lambda content, **kwargs: calls.append(content) or 0,
+    )
+
+    exit_code = docs_cmd._cmd_publish(
+        argparse.Namespace(check=False, dry_run=False, fail_on_change=False),
+    )
+
+    assert exit_code == 0
+    assert [target.render_calls for target in targets] == [1, 1]
+    assert len(calls) == 2
+
+
+def test_wrap_with_frontmatter_falls_back_to_h1_or_stem_for_unknown_slug() -> None:
+    docs = _load_generator_module()
+
+    wrapped_h1 = docs._wrap_with_frontmatter(
+        Path("docs/src/content/docs/commands/custom-topic.mdx"),
+        lambda: "# Custom Topic\n\nBody\n",
+        title_override=None,
+        slug="custom-topic",
+    )
+    rendered_h1 = wrapped_h1()
+    assert 'title: "Custom Topic"' in rendered_h1
+    assert "\n# Custom Topic\n" in rendered_h1
+
+    wrapped_stem = docs._wrap_with_frontmatter(
+        Path("docs/src/content/docs/commands/no-heading.mdx"),
+        lambda: "Body without heading\n",
+        title_override=None,
+        slug="not-registered",
+    )
+    rendered_stem = wrapped_stem()
+    assert 'title: "no-heading"' in rendered_stem
+    assert "\n# no-heading\n" in rendered_stem
+
+
+def test_wrap_with_frontmatter_uses_title_override_registry_when_slug_known() -> None:
+    docs = _load_generator_module()
+
+    wrapped = docs._wrap_with_frontmatter(
+        Path("docs/src/content/docs/commands/doctor.mdx"),
+        lambda: "# Something else\n\nBody\n",
+        title_override=None,
+        slug="doctor",
+    )
+    rendered = wrapped()
+
+    assert 'title: "rrt doctor"' in rendered
+    assert "\n# rrt doctor\n" in rendered
+
+
+def test_validate_generated_pages_reports_each_invalid_render_shape() -> None:
+    docs = _load_generator_module()
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(
+        docs,
+        "GENERATED_DOC_TARGETS",
+        (
+            docs.DocTarget(
+                Path("docs/src/content/docs/commands/no-frontmatter.mdx"), lambda: "# heading\n"
+            ),
+            docs.DocTarget(
+                Path("docs/src/content/docs/commands/malformed-frontmatter.mdx"),
+                lambda: "---\nname: x\n# heading\n",
+            ),
+            docs.DocTarget(
+                Path("docs/src/content/docs/commands/no-h1.mdx"),
+                lambda: "---\nname: x\n---\nplain body\n",
+            ),
+        ),
+        raising=False,
+    )
+    try:
+        issues = docs.validate_generated_pages()
+    finally:
+        monkeypatch.undo()
+
+    assert any("missing YAML frontmatter" in issue for issue in issues)
+    assert any("malformed YAML frontmatter" in issue for issue in issues)
+    assert any("missing top-level H1" in issue for issue in issues)
+
+
+def test_generate_readme_links_markdown_contains_all_doc_entries() -> None:
+    docs = _load_generator_module()
+
+    content = docs.generate_readme_links_markdown()
+
+    assert "https://anselmoo.github.io/repo-release-tools/" in content
+    assert "https://anselmoo.github.io/repo-release-tools/action/" in content
+    assert "docs/commands/rrt-cli.md" in content
+    assert "docs/commands/hooks.md" in content
+    assert "docs/commands/branch.md" in content
+    assert "docs/commands/git_cmd.md" in content
+    assert "docs/commands/skill.md" in content
+    assert "docs/commands/tree.md" in content
+    assert "docs/commands/toc.md" in content
+    assert "docs/commands/doctor.md" in content
+    assert "docs/commands/eol_check.md" in content
+    assert "https://anselmoo.github.io/repo-release-tools/agent-instructions/" in content
+
+
+def test_task_generate_and_check_cover_all_generated_docs(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    docs = _load_generator_module()
+    semantic_path = tmp_path / "branch.md"
+    git_path = tmp_path / "git.md"
+    cli_path = tmp_path / "rrt-cli.md"
+
+    fixed_targets = (
+        docs.DocTarget(cli_path, lambda: "cli\n"),
+        docs.DocTarget(semantic_path, lambda: "semantic\n"),
+        docs.DocTarget(git_path, lambda: "git\n"),
+    )
+    docs._build_generated_doc_targets = lambda cfg_docs=None: fixed_targets
+    docs._load_cfg_docs = lambda: None
+
+    assert docs.task_generate() == 0
+    assert cli_path.read_text(encoding="utf-8") == "cli\n"
+    assert semantic_path.read_text(encoding="utf-8") == "semantic\n"
+    assert git_path.read_text(encoding="utf-8") == "git\n"
+
+    semantic_path.write_text("stale\n", encoding="utf-8")
+    assert docs.task_check() == 1
+
+    captured = capsys.readouterr()
+    assert "branch.md is stale" in captured.err
+
+
+def test_apply_generated_docs_check_mode_fails_for_stale_file(tmp_path: Path) -> None:
+    docs = _load_generator_module()
+    output_path = tmp_path / "rrt-cli.md"
+    output_path.write_text("old\n", encoding="utf-8")
+
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    exit_code = docs.apply_generated_docs(
+        "new\n",
+        output_path=output_path,
+        check=True,
+        write=False,
+        fail_on_change=False,
+        stdout=stdout,
+        stderr=stderr,
+    )
+
+    assert exit_code == 1
+    assert output_path.read_text(encoding="utf-8") == "old\n"
+    assert stdout.getvalue() == ""
+    assert "is stale" in stderr.getvalue()
+
+
+def test_apply_generated_docs_write_and_fail_on_change_updates_file(tmp_path: Path) -> None:
+    docs = _load_generator_module()
+    output_path = tmp_path / "rrt-cli.md"
+    output_path.write_text("old\n", encoding="utf-8")
+
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    exit_code = docs.apply_generated_docs(
+        "new\n",
+        output_path=output_path,
+        check=False,
+        write=True,
+        fail_on_change=True,
+        stdout=stdout,
+        stderr=stderr,
+    )
+
+    assert exit_code == 1
+    assert output_path.read_text(encoding="utf-8") == "new\n"
+    assert stdout.getvalue() == ""
+    assert "re-stage" in stderr.getvalue()
+
+
+def test_apply_generated_docs_noops_when_content_matches(tmp_path: Path) -> None:
+    docs = _load_generator_module()
+    output_path = tmp_path / "rrt-cli.md"
+    output_path.write_text("same\n", encoding="utf-8")
+
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    exit_code = docs.apply_generated_docs(
+        "same\n",
+        output_path=output_path,
+        check=True,
+        write=False,
+        fail_on_change=False,
+        stdout=stdout,
+        stderr=stderr,
+    )
+
+    assert exit_code == 0
+    assert "up-to-date" in stdout.getvalue()
+    assert stderr.getvalue() == ""
+
+
+def test_replace_anchored_block_updates_between_markers() -> None:
+    from repo_release_tools.tools.inject import replace_anchored_block
+
+    existing = (
+        "# header\n"
+        "<!-- rrt:auto:start:example -->\n"
+        "old content\n"
+        "<!-- rrt:auto:end:example -->\n"
+        "# footer\n"
+    )
+
+    updated = replace_anchored_block(existing, anchor_id="example", content="new line")
+
+    assert updated is not None
+    assert "old content" not in updated
+    assert "new line\n" in updated
+    assert "# header" in updated and "# footer" in updated
+
+
+def test_replace_anchored_block_returns_none_when_markers_absent() -> None:
+    from repo_release_tools.tools.inject import replace_anchored_block
+
+    existing = "plain text\nwithout markers\n"
+
+    updated = replace_anchored_block(existing, anchor_id="missing", content="x")
+
+    assert updated is None
+
+
+def test_replace_anchored_block_does_not_match_prefix_anchor_ids() -> None:
+    from repo_release_tools.tools.inject import replace_anchored_block
+
+    existing = (
+        "<!-- rrt:auto:start:index-topic-links -->\nold\n<!-- rrt:auto:end:index-topic-links -->\n"
+    )
+
+    updated = replace_anchored_block(existing, anchor_id="index", content="new")
+
+    assert updated is None
+
+
+def test_replace_anchored_block_raises_for_missing_end_marker() -> None:
+    from repo_release_tools.tools.inject import replace_anchored_block
+
+    existing = "<!-- rrt:auto:start:broken -->\ncontent\n"
+
+    with pytest.raises(ValueError, match="Missing end anchor"):
+        replace_anchored_block(existing, anchor_id="broken", content="x")
+
+
+def test_replace_anchored_block_raises_for_invalid_anchor_id() -> None:
+    from repo_release_tools.tools.inject import replace_anchored_block
+
+    with pytest.raises(ValueError, match="Invalid anchor id"):
+        replace_anchored_block("any content", anchor_id="!invalid", content="x")
+
+
+def test_apply_generated_docs_anchor_mode_replaces_only_block(tmp_path: Path) -> None:
+    docs = _load_generator_module()
+    output_path = tmp_path / "target.md"
+    output_path.write_text(
+        "before\n<!-- rrt:auto:start:block -->\nold\n<!-- rrt:auto:end:block -->\nafter\n",
+        encoding="utf-8",
+    )
+
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    exit_code = docs.apply_generated_docs(
+        "new\ncontent\n",
+        output_path=output_path,
+        check=False,
+        write=True,
+        fail_on_change=False,
+        stdout=stdout,
+        stderr=stderr,
+        anchor_id="block",
+    )
+
+    rendered = output_path.read_text(encoding="utf-8")
+    assert exit_code == 0
+    assert "before\n" in rendered and "\nafter\n" in rendered
+    assert "old" not in rendered
+    assert "new\ncontent\n" in rendered
+    assert stderr.getvalue() == ""
+
+
+def test_apply_generated_docs_anchor_mode_fails_when_anchor_missing(tmp_path: Path) -> None:
+    docs = _load_generator_module()
+    output_path = tmp_path / "target.md"
+    output_path.write_text("before\nafter\n", encoding="utf-8")
+
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    exit_code = docs.apply_generated_docs(
+        "new\n",
+        output_path=output_path,
+        check=False,
+        write=True,
+        fail_on_change=False,
+        stdout=stdout,
+        stderr=stderr,
+        anchor_id="block",
+    )
+
+    assert exit_code == 1
+    assert "missing required anchors" in stderr.getvalue()
+    assert output_path.read_text(encoding="utf-8") == "before\nafter\n"
+
+
+def test_apply_generated_docs_anchor_mode_stale_hint_uses_docs_inject(tmp_path: Path) -> None:
+    docs = _load_generator_module()
+    output_path = tmp_path / "target.md"
+    output_path.write_text(
+        "before\n<!-- rrt:auto:start:block -->\nold\n<!-- rrt:auto:end:block -->\nafter\n",
+        encoding="utf-8",
+    )
+
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    exit_code = docs.apply_generated_docs(
+        "new\n",
+        output_path=output_path,
+        check=True,
+        write=False,
+        fail_on_change=False,
+        stdout=stdout,
+        stderr=stderr,
+        anchor_id="block",
+        stale_hint="rrt docs inject --check",
+    )
+
+    assert exit_code == 1
+    assert "rrt docs inject --check" in stderr.getvalue()
+
+
+def test_apply_generated_docs_anchor_mode_fails_when_file_missing(tmp_path: Path) -> None:
+    docs = _load_generator_module()
+    output_path = tmp_path / "missing-target.md"
+
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    exit_code = docs.apply_generated_docs(
+        "new\n",
+        output_path=output_path,
+        check=False,
+        write=True,
+        fail_on_change=False,
+        stdout=stdout,
+        stderr=stderr,
+        anchor_id="block",
+    )
+
+    assert exit_code == 1
+    assert "missing required anchor block" in stderr.getvalue()
+    assert not output_path.exists()
+
+
+def test_task_inject_shared_blocks_raises_for_malformed_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    docs = _load_generator_module()
+    monkeypatch.chdir(tmp_path)
+
+    (tmp_path / "pyproject.toml").write_text(
+        """
+[project]
+name = "example"
+version = "0.1.0"
+
+[[tool.rrt.version_targets]]
+path = "pyproject.toml"
+kind = "pep621"
+
+[[tool.rrt.docs.shared_blocks]]
+anchor_id = "test-footer"
+content = 123
+targets = ["docs/**/*.md"]
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match=r"shared_blocks\[0\]\.content must be a string"):
+        docs.task_inject_shared_blocks()
+
+
+# ---------------------------------------------------------------------------
+# _apply_shared_blocks / task_inject_shared_blocks / task_check_shared_blocks
+# ---------------------------------------------------------------------------
+
+_PYPROJECT_SHARED_BLOCK_RICH_INLINE = '''\
+[project]
+name = "example"
+version = "0.1.0"
+
+[[tool.rrt.version_targets]]
+path = "pyproject.toml"
+kind = "pep621"
+
+[tool.rrt.docs]
+source_repo_url = "https://github.com/Anselmoo/repo-release-tools"
+
+[[tool.rrt.docs.shared_blocks]]
+anchor_id = "test-footer"
+content = """---
+[Docs]({repo_url})
+<iframe src=\"https://example.test/embed\"></iframe>"""
+targets = ["docs/**/*.md"]
+'''
+
+_PYPROJECT_SHARED_BLOCK_INLINE = """\
+[project]
+name = "example"
+version = "0.1.0"
+
+[[tool.rrt.version_targets]]
+path = "pyproject.toml"
+kind = "pep621"
+
+[[tool.rrt.docs.shared_blocks]]
+anchor_id = "test-footer"
+content = "inline footer"
+targets = ["docs/**/*.md"]
+"""
+
+
+def _make_docs_file(tmp_path: Path, subdir: str = "docs") -> Path:
+    """Create a doc file with anchor markers for test-footer."""
+    doc_dir = tmp_path / subdir
+    doc_dir.mkdir(parents=True, exist_ok=True)
+    doc_file = doc_dir / "test.md"
+    doc_file.write_text(
+        "# Hello\n\n<!-- rrt:auto:start:test-footer -->\n<!-- rrt:auto:end:test-footer -->\n",
+        encoding="utf-8",
+    )
+    return doc_file
+
+
+def test_apply_shared_blocks_writes_rich_inline_content(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Rich inline shared block content is injected unchanged apart from placeholders."""
+    docs = _load_generator_module()
+    monkeypatch.chdir(tmp_path)
+
+    (tmp_path / "pyproject.toml").write_text(_PYPROJECT_SHARED_BLOCK_RICH_INLINE, encoding="utf-8")
+    doc_file = _make_docs_file(tmp_path)
+
+    exit_code = docs.task_inject_shared_blocks()
+    assert exit_code == 0
+
+    result = doc_file.read_text(encoding="utf-8")
+    assert "[Docs](https://github.com/Anselmoo/repo-release-tools)" in result
+    assert '<iframe src="https://example.test/embed"></iframe>' in result
+    assert "<!-- rrt:auto:start:test-footer -->" in result
+    assert "<!-- rrt:auto:end:test-footer -->" in result
+
+
+def test_apply_shared_blocks_writes_inline_content(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Shared block with inline content is injected into matching doc files."""
+    docs = _load_generator_module()
+    monkeypatch.chdir(tmp_path)
+
+    (tmp_path / "pyproject.toml").write_text(_PYPROJECT_SHARED_BLOCK_INLINE, encoding="utf-8")
+    doc_file = _make_docs_file(tmp_path)
+
+    exit_code = docs.task_inject_shared_blocks()
+    assert exit_code == 0
+    assert "inline footer" in doc_file.read_text(encoding="utf-8")
+
+
+def test_apply_shared_blocks_check_mode_fails_for_stale_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Check mode returns 1 when a block is stale (not yet injected)."""
+    docs = _load_generator_module()
+    monkeypatch.chdir(tmp_path)
+
+    (tmp_path / "pyproject.toml").write_text(_PYPROJECT_SHARED_BLOCK_INLINE, encoding="utf-8")
+    _make_docs_file(tmp_path)  # file has empty anchors — stale
+
+    exit_code = docs.task_check_shared_blocks()
+    assert exit_code == 1
+
+
+def test_apply_shared_blocks_check_mode_passes_for_current_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Check mode returns 0 when all blocks are already up to date."""
+    docs = _load_generator_module()
+    monkeypatch.chdir(tmp_path)
+
+    (tmp_path / "pyproject.toml").write_text(_PYPROJECT_SHARED_BLOCK_INLINE, encoding="utf-8")
+    _make_docs_file(tmp_path)
+
+    # Write first so the file is up to date
+    docs.task_inject_shared_blocks()
+
+    exit_code = docs.task_check_shared_blocks()
+    assert exit_code == 0
+
+
+def test_apply_shared_blocks_noop_when_no_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Returns 0 gracefully when no rrt config exists in cwd."""
+    docs = _load_generator_module()
+    monkeypatch.chdir(tmp_path)
+
+    exit_code = docs.task_inject_shared_blocks()
+    assert exit_code == 0
+
+
+def test_apply_shared_blocks_noop_when_no_shared_blocks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Returns 0 gracefully when config exists but has no shared_blocks."""
+    docs = _load_generator_module()
+    monkeypatch.chdir(tmp_path)
+
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname = "x"\nversion = "0.1.0"\n'
+        '[[tool.rrt.version_targets]]\npath = "pyproject.toml"\nkind = "pep621"\n',
+        encoding="utf-8",
+    )
+
+    exit_code = docs.task_inject_shared_blocks()
+    assert exit_code == 0
+
+
+def test_apply_shared_blocks_warns_when_no_targets_matched(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+) -> None:
+    """Logs a message when no target files match the glob patterns."""
+    docs = _load_generator_module()
+    monkeypatch.chdir(tmp_path)
+
+    (tmp_path / "pyproject.toml").write_text(_PYPROJECT_SHARED_BLOCK_INLINE, encoding="utf-8")
+    # No docs/ directory — glob matches nothing
+
+    exit_code = docs.task_inject_shared_blocks()
+    assert exit_code == 0
+    assert "no target files matched" in capsys.readouterr().out
+
+
+def test_apply_shared_blocks_rejects_legacy_template_key(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Legacy template-backed shared blocks still work with deprecation warning."""
+    docs = _load_generator_module()
+    monkeypatch.chdir(tmp_path)
+
+    (tmp_path / "scripts" / "templates").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "scripts" / "templates" / "test-footer.md").write_text(
+        "legacy footer\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "docs").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "docs" / "guide.md").write_text(
+        "# Guide\n\n<!-- rrt:auto:start:test-footer -->\n<!-- rrt:auto:end:test-footer -->\n",
+        encoding="utf-8",
+    )
+
+    (tmp_path / "pyproject.toml").write_text(
+        """
+[project]
+name = "example"
+version = "0.1.0"
+
+[[tool.rrt.version_targets]]
+path = "pyproject.toml"
+kind = "pep621"
+
+[[tool.rrt.docs.shared_blocks]]
+anchor_id = "test-footer"
+template = "scripts/templates/test-footer.md"
+targets = ["docs/**/*.md"]
+""",
+        encoding="utf-8",
+    )
+
+    with pytest.warns(DeprecationWarning, match="template is deprecated"):
+        exit_code = docs.task_inject_shared_blocks()
+    assert exit_code == 0
+    assert "legacy footer" in (tmp_path / "docs" / "guide.md").read_text(encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# RST anchor injection tests (F7)
+# ---------------------------------------------------------------------------
+
+
+def test_replace_anchored_block_rst_updates_between_markers() -> None:
+    from repo_release_tools.tools.inject import replace_anchored_block
+
+    existing = (
+        "Intro\n"
+        "\n"
+        ".. rrt:auto:start:my-anchor\n"
+        "\n"
+        "old content\n"
+        "\n"
+        ".. rrt:auto:end:my-anchor\n"
+        "\n"
+        "Footer\n"
+    )
+
+    updated = replace_anchored_block(
+        existing, anchor_id="my-anchor", content="new content", fmt="rst"
+    )
+
+    assert updated is not None
+    assert "old content" not in updated
+    assert "new content" in updated
+    assert "Intro" in updated and "Footer" in updated
+
+
+def test_replace_anchored_block_rst_returns_none_when_marker_absent() -> None:
+    from repo_release_tools.tools.inject import replace_anchored_block
+
+    existing = "plain RST text\nno markers here\n"
+
+    updated = replace_anchored_block(existing, anchor_id="missing", content="x", fmt="rst")
+
+    assert updated is None
+
+
+def test_replace_anchored_block_rst_raises_for_missing_end_marker() -> None:
+    from repo_release_tools.tools.inject import replace_anchored_block
+
+    existing = ".. rrt:auto:start:broken\n\ncontent\n"
+
+    with pytest.raises(ValueError, match="Missing end anchor"):
+        replace_anchored_block(existing, anchor_id="broken", content="x", fmt="rst")
+
+
+def test_apply_generated_docs_rst_anchor_mode_replaces_block(tmp_path: Path) -> None:
+    docs = _load_generator_module()
+    output_path = tmp_path / "target.rst"
+    output_path.write_text(
+        "Before\n\n.. rrt:auto:start:block\n\nold\n\n.. rrt:auto:end:block\n\nAfter\n",
+        encoding="utf-8",
+    )
+
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    exit_code = docs.apply_generated_docs(
+        "new content",
+        output_path=output_path,
+        check=False,
+        write=True,
+        fail_on_change=False,
+        stdout=stdout,
+        stderr=stderr,
+        anchor_id="block",
+    )
+
+    assert exit_code == 0
+    result = output_path.read_text(encoding="utf-8")
+    assert "old" not in result
+    assert "new content" in result
+    assert "Before" in result and "After" in result
+
+
+def test_apply_generated_docs_rst_missing_anchor_returns_error(tmp_path: Path) -> None:
+    docs = _load_generator_module()
+    output_path = tmp_path / "target.rst"
+    output_path.write_text("no anchors here\n", encoding="utf-8")
+
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    exit_code = docs.apply_generated_docs(
+        "content",
+        output_path=output_path,
+        check=False,
+        write=True,
+        fail_on_change=False,
+        stdout=stdout,
+        stderr=stderr,
+        anchor_id="block",
+    )
+
+    assert exit_code == 1
+    assert "rrt:auto:start:block" in stderr.getvalue()
+
+
+def test_apply_generated_docs_rst_missing_file_with_anchor_returns_error(tmp_path: Path) -> None:
+    docs = _load_generator_module()
+    output_path = tmp_path / "nonexistent.rst"
+
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    exit_code = docs.apply_generated_docs(
+        "content",
+        output_path=output_path,
+        check=False,
+        write=True,
+        fail_on_change=False,
+        stdout=stdout,
+        stderr=stderr,
+        anchor_id="block",
+    )
+
+    assert exit_code == 1
+    assert "missing" in stderr.getvalue().lower()
+
+
+# ---------------------------------------------------------------------------
+# MDX anchor injection tests
+# ---------------------------------------------------------------------------
+
+
+def test_detect_inject_format_returns_mdx_for_mdx_suffix() -> None:
+    from repo_release_tools.tools.inject import _detect_inject_format
+
+    assert _detect_inject_format(Path("docs/commands/rrt-cli.mdx")) == "mdx"
+    assert _detect_inject_format("rrt-cli.MDX") == "mdx"
+    assert _detect_inject_format(Path("docs/commands/rrt-cli.md")) == "md"
+    assert _detect_inject_format(Path("readme.rst")) == "rst"
+
+
+def test_replace_anchored_block_mdx_updates_between_markers() -> None:
+    from repo_release_tools.tools.inject import replace_anchored_block
+
+    existing = (
+        "# header\n"
+        "{/* rrt:auto:start:example */}\n"
+        "old content\n"
+        "{/* rrt:auto:end:example */}\n"
+        "# footer\n"
+    )
+
+    updated = replace_anchored_block(existing, anchor_id="example", content="new line", fmt="mdx")
+
+    assert updated is not None
+    assert "old content" not in updated
+    assert "new line\n" in updated
+    assert "# header" in updated and "# footer" in updated
+    assert "<!--" not in updated
+
+
+def test_replace_anchored_block_mdx_returns_none_when_markers_absent() -> None:
+    from repo_release_tools.tools.inject import replace_anchored_block
+
+    existing = "plain MDX text\nno markers here\n"
+
+    updated = replace_anchored_block(existing, anchor_id="missing", content="x", fmt="mdx")
+
+    assert updated is None
+
+
+def test_replace_anchored_block_mdx_does_not_match_html_comment_markers() -> None:
+    # An .mdx-formatted replace must not accidentally match the HTML-comment
+    # form still present in legacy content.
+    from repo_release_tools.tools.inject import replace_anchored_block
+
+    existing = "<!-- rrt:auto:start:example -->\nold\n<!-- rrt:auto:end:example -->\n"
+
+    updated = replace_anchored_block(existing, anchor_id="example", content="new", fmt="mdx")
+
+    assert updated is None
+
+
+def test_replace_anchored_block_mdx_raises_for_missing_end_marker() -> None:
+    from repo_release_tools.tools.inject import replace_anchored_block
+
+    existing = "{/* rrt:auto:start:broken */}\ncontent\n"
+
+    with pytest.raises(ValueError, match="Missing end anchor"):
+        replace_anchored_block(existing, anchor_id="broken", content="x", fmt="mdx")
+
+
+def test_apply_generated_docs_mdx_anchor_mode_replaces_block(tmp_path: Path) -> None:
+    docs = _load_generator_module()
+    output_path = tmp_path / "target.mdx"
+    output_path.write_text(
+        "Before\n\n{/* rrt:auto:start:block */}\nold\n{/* rrt:auto:end:block */}\n\nAfter\n",
+        encoding="utf-8",
+    )
+
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    exit_code = docs.apply_generated_docs(
+        "new content",
+        output_path=output_path,
+        check=False,
+        write=True,
+        fail_on_change=False,
+        stdout=stdout,
+        stderr=stderr,
+        anchor_id="block",
+    )
+
+    rendered = output_path.read_text(encoding="utf-8")
+    assert exit_code == 0
+    assert "Before\n" in rendered and "After\n" in rendered
+    assert "old" not in rendered
+    assert "new content" in rendered
+    assert "<!--" not in rendered
+    assert stderr.getvalue() == ""
+
+
+def test_apply_generated_docs_mdx_missing_anchor_returns_error(tmp_path: Path) -> None:
+    docs = _load_generator_module()
+    output_path = tmp_path / "target.mdx"
+    output_path.write_text("Before\n\nAfter\n", encoding="utf-8")
+
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    exit_code = docs.apply_generated_docs(
+        "new content",
+        output_path=output_path,
+        check=False,
+        write=True,
+        fail_on_change=False,
+        stdout=stdout,
+        stderr=stderr,
+        anchor_id="block",
+    )
+
+    assert exit_code == 1
+    assert "rrt:auto:start:block" in stderr.getvalue()
+    assert "{/*" in stderr.getvalue()
+
+
+def test_insert_anchor_stub_str_rejects_invalid_position() -> None:
+    from repo_release_tools.tools.inject import insert_anchor_stub_str
+
+    with pytest.raises(ValueError, match="Unsupported anchor position"):
+        insert_anchor_stub_str("content", "my-anchor", position="invalid")
+
+
+def test_insert_anchor_stub_str_rejects_negative_before_blank_lines() -> None:
+    from repo_release_tools.tools.inject import insert_anchor_stub_str
+
+    with pytest.raises(ValueError, match="before_blank_lines must be >= 0"):
+        insert_anchor_stub_str("content", "my-anchor", before_blank_lines=-1)
+
+
+def test_insert_anchor_stub_str_rejects_negative_after_blank_lines() -> None:
+    from repo_release_tools.tools.inject import insert_anchor_stub_str
+
+    with pytest.raises(ValueError, match="after_blank_lines must be >= 0"):
+        insert_anchor_stub_str("content", "my-anchor", after_blank_lines=-1)
+
+
+# ---------------------------------------------------------------------------
+# Config-driven publisher helpers
+# ---------------------------------------------------------------------------
+
+
+def test_get_command_groups_config_returns_defaults_when_no_cfg() -> None:
+    docs = _load_generator_module()
+    result = docs._get_command_groups_config(None)
+    assert result is docs.COMMAND_GROUPS_CONFIG
+
+
+def test_get_command_groups_config_uses_cfg_when_provided() -> None:
+    from repo_release_tools.config.model import CommandGroupEntry
+
+    docs = _load_generator_module()
+
+    class FakeDocs:
+        command_groups = (
+            CommandGroupEntry(slug="my-group", display="My Group", commands=("foo",)),
+        )
+
+    result = docs._get_command_groups_config(FakeDocs())
+    assert result == (("my-group", "My Group", ("foo",)),)
+
+
+def test_get_topic_page_outputs_returns_defaults_when_no_cfg() -> None:
+    docs = _load_generator_module()
+    result = docs._get_topic_page_outputs(None)
+    assert result is docs.TOPIC_PAGE_OUTPUTS
+
+
+def test_get_topic_page_outputs_uses_cfg_when_provided() -> None:
+    from pathlib import Path
+
+    from repo_release_tools.config.model import TopicPageEntry
+
+    docs = _load_generator_module()
+
+    class FakeDocs:
+        topic_pages = (TopicPageEntry(slug="mytopic", output="docs/commands/mytopic.md"),)
+
+    result = docs._get_topic_page_outputs(FakeDocs())
+    assert result == {"mytopic": Path("docs/commands/mytopic.md")}
+
+
+def test_get_title_overrides_returns_defaults_when_no_cfg() -> None:
+    docs = _load_generator_module()
+    result = docs._get_title_overrides(None)
+    assert result is docs.TITLE_OVERRIDES
+
+
+def test_get_title_overrides_uses_cfg_when_provided() -> None:
+    docs = _load_generator_module()
+
+    class FakeDocs:
+        title_overrides = {"my-page": "My Page Title"}
+
+    result = docs._get_title_overrides(FakeDocs())
+    assert result == {"my-page": "My Page Title"}
+
+
+def test_load_cfg_docs_returns_none_when_no_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    docs = _load_generator_module()
+    monkeypatch.chdir(tmp_path)
+    result = docs._load_cfg_docs()
+    assert result is None
+
+
+def test_load_cfg_docs_returns_docs_config_when_present(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    docs = _load_generator_module()
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname = "x"\nversion = "0.1.0"\n'
+        '[[tool.rrt.version_targets]]\npath = "pyproject.toml"\nkind = "pep621"\n'
+        '[tool.rrt.docs]\nsource_repo_url = "https://example.com"\n',
+        encoding="utf-8",
+    )
+    result = docs._load_cfg_docs()
+    assert result is not None
+    assert getattr(result, "source_repo_url", None) == "https://example.com"
+
+
+def test_load_cfg_docs_returns_none_for_missing_rrt_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    docs = _load_generator_module()
+    import repo_release_tools.config as _cfg_mod
+
+    sentinel = ValueError("no [tool.rrt]")
+
+    def _raise(_path: object) -> None:
+        raise sentinel
+
+    monkeypatch.setattr(_cfg_mod, "load_config", _raise)
+    monkeypatch.setattr(_cfg_mod, "is_missing_tool_rrt_error", lambda exc: exc is sentinel)
+    result = docs._load_cfg_docs()
+    assert result is None
+
+
+def test_load_cfg_docs_reraises_unknown_value_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    docs = _load_generator_module()
+    import repo_release_tools.config as _cfg_mod
+
+    sentinel = ValueError("unexpected config error")
+
+    def _raise(_path: object) -> None:
+        raise sentinel
+
+    monkeypatch.setattr(_cfg_mod, "load_config", _raise)
+    monkeypatch.setattr(_cfg_mod, "is_missing_tool_rrt_error", lambda _exc: False)
+    with pytest.raises(ValueError, match="unexpected config error"):
+        docs._load_cfg_docs()

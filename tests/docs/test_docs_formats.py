@@ -1,0 +1,332 @@
+"""Tests for docs_formats.py — format renderers for rrt docs generate."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+from repo_release_tools.config import DocsConfig
+from repo_release_tools.docs.extractor import DocEntry
+from repo_release_tools.docs.formats import (
+    inject_md,
+    render,
+    render_json,
+    render_md,
+    render_rich,
+    render_txt,
+)
+from repo_release_tools.docs.formats.richtext import render_structured_rich
+from repo_release_tools.state import hash_content
+
+
+def _entry(
+    name: str = "example",
+    content: str = "Example content.",
+    lang: str = "python",
+) -> DocEntry:
+    return DocEntry(
+        name=name,
+        lang=lang,
+        content=content,
+        source_file="src/mod.py",
+        line=1,
+        hash=hash_content(content),
+    )
+
+
+def _config() -> DocsConfig:
+    return DocsConfig(
+        extraction_mode="explicit",
+        languages=("python",),
+        src_dir="src",
+        formats=("json",),
+    )
+
+
+def _config_with_source_links() -> DocsConfig:
+    return DocsConfig(
+        extraction_mode="explicit",
+        languages=("python",),
+        src_dir="src",
+        formats=("json",),
+        source_repo_url="https://github.com/Anselmoo/repo-release-tools",
+        source_ref="main",
+        source_url_template="{repo_url}/blob/{ref}/{path}#L{line}",
+    )
+
+
+class TestRenderMd:
+    """Tests for render_md."""
+
+    def test_render_md_returns_markdown(self) -> None:
+        entries = [_entry("hello", "Hello docs.")]
+        result = render_md(entries, _config())
+        assert "# Documentation" in result
+        assert "hello" in result
+        assert "Hello docs." in result
+
+    def test_render_md_empty(self) -> None:
+        result = render_md([], _config())
+        assert "# Documentation" in result
+
+    def test_render_md_includes_source_link(self) -> None:
+        entries = [_entry("hello", "Hello docs.")]
+        result = render_md(entries, _config_with_source_links())
+        assert (
+            "[src/mod.py:1](https://github.com/Anselmoo/repo-release-tools/blob/main/src/mod.py#L1)"
+            in result
+        )
+
+    def test_render_md_uses_fallback_source_url_when_no_template_is_set(self) -> None:
+        config = DocsConfig(
+            extraction_mode="explicit",
+            languages=("python",),
+            src_dir="src",
+            formats=("json",),
+            source_repo_url="https://github.com/Anselmoo/repo-release-tools",
+            source_ref="main",
+        )
+
+        result = render_md([_entry("hello", "Hello docs.")], config)
+
+        assert (
+            "[src/mod.py:1](https://github.com/Anselmoo/repo-release-tools/blob/main/src/mod.py#L1)"
+            in result
+        )
+
+    def test_render_md_normalizes_windows_source_path(self) -> None:
+        entry = _entry("hello", "Hello docs.")
+        entry = DocEntry(
+            name=entry.name,
+            lang=entry.lang,
+            content=entry.content,
+            source_file="src\\mod.py",
+            line=entry.line,
+            hash=entry.hash,
+        )
+
+        result = render_md([entry], _config_with_source_links())
+
+        assert (
+            "[src/mod.py:1](https://github.com/Anselmoo/repo-release-tools/blob/main/src/mod.py#L1)"
+            in result
+        )
+
+    def test_render_md_rejects_invalid_source_url_template(self) -> None:
+        config = DocsConfig(
+            extraction_mode="explicit",
+            languages=("python",),
+            src_dir="src",
+            formats=("json",),
+            source_repo_url="https://github.com/Anselmoo/repo-release-tools",
+            source_ref="main",
+            source_url_template="{repo_url}/blob/{missing}/{path}#L{line}",
+        )
+
+        with pytest.raises(ValueError, match="Supported placeholders"):
+            render_md([_entry()], config)
+
+
+class TestInjectMd:
+    """Tests for inject_md — lines 54-64."""
+
+    def test_inject_md_nonexistent_file(self, tmp_path: Path) -> None:
+        """When target_file does not exist, should return empty string (no anchors)."""
+        target = tmp_path / "MISSING.md"
+        entries = [_entry("hello", "Hello docs.")]
+        result = inject_md(entries, _config(), target_file=target)
+        # No anchors in empty string → result unchanged (empty)
+        assert isinstance(result, str)
+
+    def test_inject_md_existing_file_no_anchors(self, tmp_path: Path) -> None:
+        """Existing file with no matching anchors should be returned unchanged."""
+        target = tmp_path / "README.md"
+        target.write_text("# My project\nNo anchors here.\n", encoding="utf-8")
+        entries = [_entry("hello", "Hello docs.")]
+        result = inject_md(entries, _config(), target_file=target)
+        assert result == "# My project\nNo anchors here.\n"
+
+    def test_inject_md_replaces_anchor_block(self, tmp_path: Path) -> None:
+        """Should replace content between matching anchor comments."""
+        target = tmp_path / "README.md"
+        target.write_text(
+            "# Title\n"
+            "<!-- rrt:auto:start:docs.hello -->\n"
+            "old content\n"
+            "<!-- rrt:auto:end:docs.hello -->\n"
+            "Footer\n",
+            encoding="utf-8",
+        )
+        entries = [_entry("hello", "New docs.")]
+        result = inject_md(entries, _config(), target_file=target)
+        assert "New docs." in result
+        assert "old content" not in result
+
+    def test_inject_md_multiple_entries(self, tmp_path: Path) -> None:
+        """Should replace multiple anchor blocks."""
+        target = tmp_path / "README.md"
+        target.write_text(
+            "<!-- rrt:auto:start:docs.a -->\nold a\n<!-- rrt:auto:end:docs.a -->\n"
+            "<!-- rrt:auto:start:docs.b -->\nold b\n<!-- rrt:auto:end:docs.b -->\n",
+            encoding="utf-8",
+        )
+        entries = [_entry("a", "New A."), _entry("b", "New B.")]
+        result = inject_md(entries, _config(), target_file=target)
+        assert "New A." in result
+        assert "New B." in result
+
+
+class TestRenderTxt:
+    """Tests for render_txt."""
+
+    def test_render_txt_contains_name(self) -> None:
+        entries = [_entry("hello", "Hello docs.")]
+        result = render_txt(entries, _config())
+        assert "hello" in result
+        assert "Hello docs." in result
+
+    def test_render_txt_includes_source_url(self) -> None:
+        entries = [_entry("hello", "Hello docs.")]
+        result = render_txt(entries, _config_with_source_links())
+        assert "Source: src/mod.py:1" in result
+        assert "https://github.com/Anselmoo/repo-release-tools/blob/main/src/mod.py#L1" in result
+
+    def test_render_txt_flattens_markdown_headings(self) -> None:
+        entries = [_entry("hello", "# Overview\n\nBody text\n\n## Details\nMore text")]
+
+        result = render_txt(entries, _config())
+
+        assert "OVERVIEW\n========" in result
+        assert "Details\n-------" in result
+        assert "# Overview" not in result
+
+    def test_render_txt_formats_deeper_heading_levels_as_bullets(self) -> None:
+        entries = [_entry("hello", "# Overview\nLead-in\n### Deep dive")]
+
+        result = render_txt(entries, _config())
+
+        assert "Lead-in\n\n* Deep dive" in result
+
+    def test_render_txt_ignores_headings_inside_fenced_code(self) -> None:
+        entries = [_entry("hello", "```python\n# not a heading\n```\nplain text")]
+
+        result = render_txt(entries, _config())
+
+        assert "# not a heading" in result
+
+
+class TestRenderRich:
+    """Tests for render_rich."""
+
+    def test_render_rich_strips_markdown_heading_markers(self) -> None:
+        entries = [_entry("hello", "# Overview\n\nBody text\n\n### Deep dive")]
+
+        result = render_rich(entries, _config())
+
+        assert "Overview" in result
+        assert "Deep dive" in result
+        assert "# Overview" not in result
+        assert "### Deep dive" not in result
+
+    def test_render_rich_handles_nested_headings_and_fences(self) -> None:
+        entries = [
+            _entry(
+                "hello",
+                "# Overview\n\n## Details\n```python\nprint('x')\n```\nBody text",
+            ),
+        ]
+
+        result = render_rich(entries, _config())
+
+        assert "Overview" in result
+        assert "Details" in result
+        assert "```python" in result
+        assert "print('x')" in result
+        assert "## Details" not in result
+
+    def test_render_rich_plain_prose_uses_legacy_line_rendering(self) -> None:
+        entries = [_entry("hello", "Plain prose\nSecond line")]
+
+        result = render_rich(entries, _config())
+
+        assert "Plain prose" in result
+        assert "Second line" in result
+
+    def test_render_rich_includes_source_url(self) -> None:
+        entries = [_entry("hello", "Plain prose")]
+        result = render_rich(entries, _config_with_source_links())
+        assert "https://github.com/Anselmoo/repo-release-tools/blob/main/src/mod.py#L1" in result
+
+    def test_render_structured_rich_no_headings_returns_raw_content(self) -> None:
+        result = render_structured_rich("plain text no headings")
+        assert result == "plain text no headings"
+
+    def test_render_structured_rich_empty_string_does_not_raise(self) -> None:
+        result = render_structured_rich("")
+        assert result == ""
+
+
+class TestRenderJson:
+    """Tests for render_json."""
+
+    def test_render_json_produces_valid_json(self) -> None:
+        import json
+
+        entries = [_entry("hello", "Hello docs.")]
+        result = render_json(entries, _config())
+        parsed = json.loads(result)
+        assert len(parsed) == 1
+        assert parsed[0]["name"] == "hello"
+
+    def test_render_json_includes_source_url(self) -> None:
+        import json
+
+        entries = [_entry("hello", "Hello docs.")]
+        result = render_json(entries, _config_with_source_links())
+        parsed = json.loads(result)
+        assert parsed[0]["source_url"].endswith("/blob/main/src/mod.py#L1")
+
+
+class TestRender:
+    """Tests for the render() dispatcher — lines 182, 186."""
+
+    def test_render_toml_requires_root(self) -> None:
+        """Should raise ValueError when format='toml' and root is None."""
+        with pytest.raises(ValueError, match="root="):
+            render("toml", [], _config(), root=None)
+
+    def test_render_unsupported_format_raises(self) -> None:
+        """Should raise ValueError for unknown format."""
+        with pytest.raises(ValueError, match="Unsupported format"):
+            render("xml", [], _config())
+
+    def test_render_md(self) -> None:
+        """Should dispatch to render_md."""
+        result = render("md", [_entry()], _config())
+        assert "# Documentation" in result
+
+    def test_render_json(self) -> None:
+        """Should dispatch to render_json."""
+        import json
+
+        result = render("json", [_entry()], _config())
+        parsed = json.loads(result)
+        assert isinstance(parsed, list)
+
+    def test_render_toml_with_root(self, tmp_path: Path) -> None:
+        """Should write lockfile and return TOML text when root is provided."""
+        result = render("toml", [_entry()], _config(), root=tmp_path)
+        assert isinstance(result, str)
+        lock_path = tmp_path / ".rrt" / "docs.lock.toml"
+        assert lock_path.exists()
+
+
+class TestHtmlRenderer:
+    """Tests for the HTML format renderer stub."""
+
+    def test_render_html_raises_not_implemented(self) -> None:
+        from repo_release_tools.docs.formats.html import render_html
+
+        with pytest.raises(NotImplementedError):
+            render_html([_entry()], _config())

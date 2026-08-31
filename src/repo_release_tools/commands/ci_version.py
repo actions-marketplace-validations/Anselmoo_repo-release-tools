@@ -1,55 +1,84 @@
-"""CI version computation and application command.
+"""Compute and apply CI release versions from ``[tool.rrt]`` config.
 
-Mirrors the behaviour of the ``scripts/ci_version.py`` helper used by
-``copilot-plugin-manager``, but driven by ``[tool.rrt]`` configuration
-rather than hard-coded file paths.
+# file: ci_version.py
 
-Version semantics
------------------
-* **Tag builds** (``refs/tags/v*``): the tag name with the ``v`` prefix
-  stripped is used as-is.
-* **Main branch** (``refs/heads/main``): a PEP 440 dev release is computed
-  as ``{base}.dev{GITHUB_RUN_ID}{GITHUB_RUN_ATTEMPT:02d}``.
-* **All other refs**: the base version is returned unchanged.
+## Overview
 
-When applying a version the output format depends on the ``ci_format``
-field on each ``[[tool.rrt.version_targets]]`` entry:
+The ``rrt ci-version`` command family centralizes deterministic version
+computation and safe application for CI and release automation. It reads the
+repository's ``[tool.rrt]`` configuration, discovers version targets and group
+defaults, and uses the current CI environment (or explicit CLI overrides) to
+produce machine-friendly version identifiers suitable for downstream CI
+targets and release workflows.
 
-* ``"pep440"``    – version string applied unchanged (``0.2.0.dev12345601``).
-* ``"semver_pre"`` – version converted via :func:`to_semver` before writing
-  (``0.2.0-dev.12345601``).
+Subcommands:
+
+- ``compute`` — deterministically compute the version for this run and emit a
+    single raw line for scripting and capture.
+- ``apply`` — update configured targets that declare a ``ci_format``,
+    transforming values when needed (for example converting PEP 440 dev
+    releases into Cargo-compatible prerelease identifiers).
+- ``sync`` — compute then apply the published version in one operation; both
+    ``apply`` and ``sync`` support ``--dry-run`` for safe previews.
+
+Version rules (summary):
+
+- Tag builds (``refs/tags/v*``) yield the tag name with the leading ``v``
+    removed.
+- Mainline (`refs/heads/main`) builds produce a PEP 440 dev release using
+    ``{base}.dev{GITHUB_RUN_ID}{GITHUB_RUN_ATTEMPT:02d}``.
+- Other refs return the configured base version unchanged. CLI flags such as
+    ``--ref``, ``--run-id``, or ``--base`` override environment-derived values.
+
+Output formats & safety:
+
+- Supported target formats: ``pep440`` and ``semver_pre`` (the latter maps
+    PEP 440 dev suffixes to SemVer prerelease tokens).
+- The command validates conversions and fails fast on incompatible inputs to
+    avoid writing invalid CI data.
+- ``compute`` is machine-friendly (single-line stdout); ``apply``/``sync`` are
+    human-friendly with progress, dry-run previews, and explicit error messages.
+
+Examples::
+
+        rrt ci-version compute
+        rrt ci-version apply 1.2.3.dev42 --group backend --dry-run
+
 """
 
 from __future__ import annotations
 
 import argparse
 import os
-import re
 import sys
-
 from dataclasses import dataclass
 from pathlib import Path
 
-from repo_release_tools import output
+from repo_release_tools.commands._cli_shared import add_dry_run_flag
+from repo_release_tools.commands._common import describe_config_load_error
+from repo_release_tools.commands._registry import CommandCategory, CommandGroup, register_command
+from repo_release_tools.commands._version_render import render_version_write_events
 from repo_release_tools.config import (
     VALID_CI_FORMATS,
+    find_repo_root,
     format_autodetected_config_notice,
-    format_missing_tool_rrt_guidance,
-    is_missing_tool_rrt_error,
-    iter_config_files,
     load_or_autodetect_config,
 )
-from repo_release_tools.version_targets import (
+from repo_release_tools.ui import (
+    GLYPHS,
+    DryRunPrinter,
+    ProgressLine,
+    VerbosePrinter,
+    rule,
+    subtle,
+    terminal_width,
+)
+from repo_release_tools.version.pep440 import pep440_dev_to_semver
+from repo_release_tools.version.targets import (
     check_autodetected_version_consistency,
     read_group_current_version,
     replace_version_in_file,
 )
-
-
-# Regex that matches the PEP 440 dev-release suffix so it can be converted
-# to a Cargo-compatible SemVer prerelease identifier.
-_SEMVER_DEV_RE = re.compile(r"\.dev(?P<build>\d+)$")
-
 
 # ---------------------------------------------------------------------------
 # GitHub Actions context
@@ -66,7 +95,7 @@ class GitHubContext:
     run_attempt: str
 
     @classmethod
-    def from_env(cls) -> "GitHubContext":
+    def from_env(cls) -> GitHubContext:
         """Build a context object from the current process environment."""
         return cls(
             ref=os.environ.get("GITHUB_REF", ""),
@@ -74,21 +103,6 @@ class GitHubContext:
             run_id=os.environ.get("GITHUB_RUN_ID", "0"),
             run_attempt=os.environ.get("GITHUB_RUN_ATTEMPT", "1"),
         )
-
-
-# ---------------------------------------------------------------------------
-# Pure version helpers
-# ---------------------------------------------------------------------------
-
-
-def to_semver(version: str) -> str:
-    """Convert a PEP 440 dev-release string to a Cargo-compatible SemVer prerelease.
-
-    ``0.2.0.dev12345601`` → ``0.2.0-dev.12345601``
-
-    Release versions (no ``.dev`` suffix) are returned unchanged.
-    """
-    return _SEMVER_DEV_RE.sub(r"-dev.\g<build>", version)
 
 
 def compute_published_version(base_version: str, context: GitHubContext) -> str:
@@ -112,7 +126,7 @@ def compute_published_version(base_version: str, context: GitHubContext) -> str:
         except ValueError as exc:
             raise ValueError(
                 f"Invalid GitHub run attempt value {context.run_attempt!r}; "
-                "GITHUB_RUN_ATTEMPT/--run-attempt must be an integer."
+                "GITHUB_RUN_ATTEMPT/--run-attempt must be an integer.",
             ) from exc
         return f"{base_version}.dev{context.run_id}{attempt:02d}"
 
@@ -120,47 +134,132 @@ def compute_published_version(base_version: str, context: GitHubContext) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Typed options
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ComputeOptions:
+    """Typed view of ``argparse.Namespace`` for ``rrt ci-version compute``.
+
+    Built once via :meth:`from_args` at the top of :func:`cmd_ci_version_compute`
+    (and reused by :func:`cmd_ci_version_sync`, which shares the same flag
+    surface) so every flag has a single, typed read site instead of scattered
+    ``getattr(args, ..., default)`` calls throughout the function bodies.
+    """
+
+    verbose: int
+    base: str | None
+    group: str | None
+    ref: str | None
+    ref_name: str | None
+    run_id: str | None
+    run_attempt: str | None
+    dry_run: bool
+
+    @classmethod
+    def from_args(cls, args: argparse.Namespace) -> ComputeOptions:
+        """Build a :class:`ComputeOptions` from a parsed ``argparse.Namespace``.
+
+        Every flag below is given a real default by ``_add_compute_args``
+        (or, for ``--verbose``, by cli.py's global parser), so a Namespace
+        produced by argparse always carries every attribute. The getattr
+        fallbacks here exist only because some unit tests in
+        tests/commands/test_ci_version.py construct sparse
+        ``argparse.Namespace`` objects by hand instead of going through
+        ``register()``; this is the single translation point that absorbs
+        that, so the rest of the command can read ``opts.x`` unconditionally.
+        ``dry_run`` is absent on ``compute`` (no ``--dry-run`` flag there) so
+        it defaults to ``False``; ``sync`` always sets it via argparse.
+        """
+        return cls(
+            verbose=getattr(args, "verbose", 0) or 0,
+            base=getattr(args, "base", None),
+            group=getattr(args, "group", None),
+            ref=getattr(args, "ref", None),
+            ref_name=getattr(args, "ref_name", None),
+            run_id=getattr(args, "run_id", None),
+            run_attempt=getattr(args, "run_attempt", None),
+            dry_run=getattr(args, "dry_run", False),
+        )
+
+
+@dataclass(frozen=True)
+class ApplyOptions:
+    """Typed view of ``argparse.Namespace`` for ``rrt ci-version apply``.
+
+    Built once via :meth:`from_args` at the top of :func:`cmd_ci_version_apply`
+    so every flag has a single, typed read site instead of scattered
+    ``getattr(args, ..., default)`` / ``args.x`` calls throughout the
+    function body.
+    """
+
+    verbose: int
+    version: str
+    dry_run: bool
+    group: str | None
+
+    @classmethod
+    def from_args(cls, args: argparse.Namespace) -> ApplyOptions:
+        """Build an :class:`ApplyOptions` from a parsed ``argparse.Namespace``.
+
+        ``version`` and ``dry_run`` are given real defaults by ``register()``
+        (``version`` is a required positional, ``dry_run`` defaults to
+        ``False`` via ``store_true``), so a Namespace produced by argparse
+        always carries both. The getattr fallbacks here exist only because
+        some unit tests construct sparse ``argparse.Namespace`` objects by
+        hand (e.g. without ``group`` or ``verbose``); this is the single
+        translation point that absorbs that.
+        """
+        return cls(
+            verbose=getattr(args, "verbose", 0) or 0,
+            version=getattr(args, "version", ""),
+            dry_run=getattr(args, "dry_run", False),
+            group=getattr(args, "group", None),
+        )
+
+
+# ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
 
 
-def _context_from_args(args: argparse.Namespace) -> GitHubContext:
+def _context_from_opts(opts: ComputeOptions) -> GitHubContext:
     """Build a :class:`GitHubContext` merging CLI flags over env variables."""
     env = GitHubContext.from_env()
     return GitHubContext(
-        ref=getattr(args, "ref", None) or env.ref,
-        ref_name=getattr(args, "ref_name", None) or env.ref_name,
-        run_id=getattr(args, "run_id", None) or env.run_id,
-        run_attempt=getattr(args, "run_attempt", None) or env.run_attempt,
+        ref=opts.ref or env.ref,
+        ref_name=opts.ref_name or env.ref_name,
+        run_id=opts.run_id or env.run_id,
+        run_attempt=opts.run_attempt or env.run_attempt,
     )
 
 
-def _resolve_base(args: argparse.Namespace, root: Path) -> str | None:
+def _resolve_base(opts: ComputeOptions, root: Path) -> str | None:
     """Return the base version string from ``--base`` or the first version target."""
-    if args.base:
-        return args.base
+    if opts.base:
+        return opts.base
     try:
         config = load_or_autodetect_config(root)
         if config.autodetected:
-            print(output.warning(format_autodetected_config_notice(config)), file=sys.stderr)
+            p = VerbosePrinter()
+            p.line(format_autodetected_config_notice(config), ok=False, stream=sys.stderr)
             if mismatch := check_autodetected_version_consistency(config):
-                print(mismatch, file=sys.stderr)
+                p.line(mismatch, ok=False, stream=sys.stderr)
                 return None
-        group = config.resolve_group(getattr(args, "group", None))
+        group = config.resolve_group(opts.group)
         return str(read_group_current_version(group))
-    except FileNotFoundError:
-        print(output.warning("No supported rrt config file found."), file=sys.stderr)
-        print(format_missing_tool_rrt_guidance(root, []), file=sys.stderr)
-        return None
-    except ValueError as exc:
-        if is_missing_tool_rrt_error(exc):
-            print(output.warning("No [tool.rrt] configuration found."), file=sys.stderr)
-            print(format_missing_tool_rrt_guidance(root, iter_config_files(root)), file=sys.stderr)
-            return None
-        print(str(exc), file=sys.stderr)
-        return None
-    except RuntimeError as exc:
-        print(str(exc), file=sys.stderr)
+    except (FileNotFoundError, ValueError, RuntimeError) as exc:
+        err = describe_config_load_error(exc, root)
+        p = VerbosePrinter()
+        if err.kind == "no_config_file":
+            p.line("No supported rrt config file found.", ok=False, stream=sys.stderr)
+            p.action(err.text, stream=sys.stderr)
+        elif err.kind == "missing_tool_rrt":
+            p.line("No [tool.rrt] configuration found.", ok=False, stream=sys.stderr)
+            p.action(err.text, stream=sys.stderr)
+        else:
+            p.line(err.text, ok=False, stream=sys.stderr)
         return None
 
 
@@ -177,18 +276,22 @@ def cmd_ci_version_compute(args: argparse.Namespace) -> int:
 
         VERSION=$(rrt ci-version compute)
     """
-    root = Path.cwd()
-    base = _resolve_base(args, root)
+    opts = ComputeOptions.from_args(args)
+
+    root = find_repo_root(Path.cwd())
+    base = _resolve_base(opts, root)
     if base is None:
         return 1
 
-    context = _context_from_args(args)
+    context = _context_from_opts(opts)
     try:
         version = compute_published_version(base, context)
     except ValueError as exc:
-        print(str(exc), file=sys.stderr)
+        p = VerbosePrinter(verbose=opts.verbose)
+        p.line(str(exc), ok=False, stream=sys.stderr)
         return 1
-    print(version)
+    # Machine-readable output: keep raw version on stdout
+    sys.stdout.write(version + "\n")
     return 0
 
 
@@ -197,68 +300,88 @@ def cmd_ci_version_apply(args: argparse.Namespace) -> int:
 
     Python targets (``ci_format = "pep440"``) receive the version as-is.
     Cargo / TOML targets (``ci_format = "semver_pre"``) receive the version
-    after conversion via :func:`to_semver`.
+    after conversion via :func:`~repo_release_tools.version.pep440.pep440_dev_to_semver`.
     """
-    root = Path.cwd()
+    opts = ApplyOptions.from_args(args)
+    root = find_repo_root(Path.cwd())
 
     try:
         config = load_or_autodetect_config(root)
         if config.autodetected:
-            print(output.warning(format_autodetected_config_notice(config)), file=sys.stderr)
-        group = config.resolve_group(getattr(args, "group", None))
-    except FileNotFoundError:
-        print(output.warning("No supported rrt config file found."), file=sys.stderr)
-        print(format_missing_tool_rrt_guidance(root, []), file=sys.stderr)
-        return 1
-    except ValueError as exc:
-        if is_missing_tool_rrt_error(exc):
-            print(output.warning("No [tool.rrt] configuration found."), file=sys.stderr)
-            print(format_missing_tool_rrt_guidance(root, iter_config_files(root)), file=sys.stderr)
-            return 1
-        print(str(exc), file=sys.stderr)
-        return 1
-    except RuntimeError as exc:
-        print(str(exc), file=sys.stderr)
+            p = VerbosePrinter(verbose=opts.verbose)
+            p.line(format_autodetected_config_notice(config), ok=False, stream=sys.stderr)
+        group = config.resolve_group(opts.group)
+    except (FileNotFoundError, ValueError, RuntimeError) as exc:
+        err = describe_config_load_error(exc, root)
+        p = VerbosePrinter(verbose=opts.verbose)
+        if err.kind == "no_config_file":
+            p.line("No supported rrt config file found.", ok=False, stream=sys.stderr)
+            p.action(err.text, stream=sys.stderr)
+        elif err.kind == "missing_tool_rrt":
+            p.line("No [tool.rrt] configuration found.", ok=False, stream=sys.stderr)
+            p.action(err.text, stream=sys.stderr)
+        else:
+            p.line(err.text, ok=False, stream=sys.stderr)
         return 1
 
     ci_targets = [t for t in group.version_targets if t.ci_format in VALID_CI_FORMATS]
     if not ci_targets:
-        print(
+        p = VerbosePrinter(verbose=opts.verbose)
+        p.line(
             "No version targets with ci_format configured. "
             'Add ci_format = "pep440" or ci_format = "semver_pre" to the selected version group.',
-            file=sys.stderr,
+            ok=False,
+            stream=sys.stderr,
         )
         return 1
 
-    version: str = args.version
+    version: str = opts.version
 
-    print(output.section("Applying CI versions"))
-    for target in ci_targets:
+    progress = ProgressLine(file=sys.stdout)
+    p = DryRunPrinter(opts.dry_run, verbose=opts.verbose)
+    p.line(rule("Applying CI versions", width=terminal_width()))
+    total = len(ci_targets)
+    for i, target in enumerate(ci_targets, 1):
         if target.ci_format == "semver_pre":
-            version_str = to_semver(version)
-            # If the version contains a PEP 440 dev marker but to_semver() made
-            # no change, the suffix pattern was not a plain `.devN`. Fail fast
+            version_str = pep440_dev_to_semver(version)
+            # If the version contains a PEP 440 dev marker but pep440_dev_to_semver()
+            # made no change, the suffix pattern was not a plain `.devN`. Fail fast
             # rather than writing an invalid Cargo SemVer string.
             if version_str == version and ".dev" in version:
-                print(
+                progress.clear()
+                p_err = VerbosePrinter(verbose=opts.verbose)
+                p_err.line(
                     f"Cannot convert {version!r} to a Cargo-compatible SemVer prerelease. "
                     "Only versions ending in '.dev<digits>' are supported (e.g. 0.2.0.dev42).",
-                    file=sys.stderr,
+                    ok=False,
+                    stream=sys.stderr,
                 )
                 return 1
         else:
             version_str = version
+        if total > 1 and i > 1:
+            progress.clear()
         try:
-            replace_version_in_file(target, version_str, dry_run=args.dry_run)
+            event = replace_version_in_file(target, version_str, dry_run=opts.dry_run)
+            render_version_write_events([event])
         except (FileNotFoundError, RuntimeError) as exc:
-            print(str(exc), file=sys.stderr)
+            progress.clear()
+            p = VerbosePrinter(verbose=opts.verbose)
+            p.line(str(exc), ok=False, stream=sys.stderr)
             return 1
+        if total > 1:
+            progress.update_bar(i / total)
 
-    print()
-    if args.dry_run:
-        print(output.dry_run_complete("no files were modified"))
+    progress.clear()
+    p.blank_line()
+    if opts.dry_run:
+        p.line(
+            subtle(
+                f"{GLYPHS.bullet.skip} [dry-run] complete {GLYPHS.typography.mdash} no files were modified",
+            ),
+        )
     else:
-        print(output.ok("Done."))
+        p.ok("Done.")
     return 0
 
 
@@ -267,23 +390,49 @@ def cmd_ci_version_sync(args: argparse.Namespace) -> int:
 
     Equivalent to running ``compute`` followed by ``apply`` with the result.
     """
-    root = Path.cwd()
-    base = _resolve_base(args, root)
+    opts = ComputeOptions.from_args(args)
+
+    root = find_repo_root(Path.cwd())
+    base = _resolve_base(opts, root)
     if base is None:
         return 1
 
-    context = _context_from_args(args)
+    context = _context_from_opts(opts)
     try:
         version = compute_published_version(base, context)
     except ValueError as exc:
-        print(str(exc), file=sys.stderr)
+        p = VerbosePrinter(verbose=opts.verbose)
+        p.line(str(exc), ok=False, stream=sys.stderr)
         return 1
-    print(f"Applying published version: {version}")
+    p = VerbosePrinter(verbose=opts.verbose)
+    p.action(f"Applying published version: {version}")
 
     apply_args = argparse.Namespace(
-        version=version, dry_run=args.dry_run, group=getattr(args, "group", None)
+        version=version,
+        dry_run=opts.dry_run,
+        group=opts.group,
     )
     return cmd_ci_version_apply(apply_args)
+
+
+CI_VERSION_EXAMPLES = (
+    "  $ rrt ci-version compute\n  $ rrt ci-version apply 1.2.3.dev4\n  $ rrt ci-version sync"
+)
+
+CI_VERSION_COMPUTE_EXAMPLES = (
+    "  $ rrt ci-version compute\n"
+    "  $ rrt ci-version compute --base 1.2.3 --ref refs/heads/main --run-id 42 --run-attempt 3"
+)
+
+CI_VERSION_APPLY_EXAMPLES = (
+    "  $ rrt ci-version apply 1.2.3.dev4201\n"
+    "  $ rrt ci-version apply 1.2.3.dev4201 --group backend --dry-run"
+)
+
+CI_VERSION_SYNC_EXAMPLES = (
+    "  $ rrt ci-version sync --dry-run\n"
+    "  $ rrt ci-version sync --group backend --ref refs/heads/main --run-id 42 --run-attempt 1"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -335,18 +484,30 @@ def _add_compute_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
+@register_command(
+    name="ci-version", category=CommandCategory.WRITE, group=CommandGroup.VERSION_RELEASE
+)
 def register(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
     """Register the ``ci-version`` command and its subcommands."""
     parser = subparsers.add_parser(
         "ci-version",
         help="Compute and apply CI pre-release versions (PEP 440 / SemVer).",
+        description="Compute and apply CI pre-release versions (PEP 440 / SemVer).",
+        epilog=CI_VERSION_EXAMPLES,
     )
-    sub = parser.add_subparsers(dest="ci_version_cmd", required=True)
+    sub = parser.add_subparsers(
+        dest="ci_version_cmd",
+        metavar="<ci_version_cmd>",
+        parser_class=type(parser),
+        required=True,
+    )
 
     # compute ----------------------------------------------------------------
     compute_parser = sub.add_parser(
         "compute",
         help="Print the published version for the current GitHub Actions run.",
+        description="Print the CI/published version for the current GitHub Actions context, using --base and --group overrides when provided.",
+        epilog=CI_VERSION_COMPUTE_EXAMPLES,
     )
     _add_compute_args(compute_parser)
     compute_parser.set_defaults(handler=cmd_ci_version_compute)
@@ -355,14 +516,14 @@ def register(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) ->
     apply_parser = sub.add_parser(
         "apply",
         help="Apply a concrete version string to all ci_format-configured targets.",
+        description="Apply one explicit CI version string to every configured ci_format target in the selected version group.",
+        epilog=CI_VERSION_APPLY_EXAMPLES,
     )
     apply_parser.add_argument(
         "version",
         help="Version string to apply (e.g. 0.2.0.dev12345601).",
     )
-    apply_parser.add_argument(
-        "--dry-run", action="store_true", help="Preview without writing changes."
-    )
+    add_dry_run_flag(apply_parser, verb="writing changes")
     apply_parser.add_argument(
         "--group",
         default=None,
@@ -375,9 +536,9 @@ def register(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) ->
     sync_parser = sub.add_parser(
         "sync",
         help="Compute the published version from GitHub Actions env and apply it.",
+        description="Compute the current GitHub Actions CI version and apply it to every configured ci_format target.",
+        epilog=CI_VERSION_SYNC_EXAMPLES,
     )
     _add_compute_args(sync_parser)
-    sync_parser.add_argument(
-        "--dry-run", action="store_true", help="Preview without writing changes."
-    )
+    add_dry_run_flag(sync_parser, verb="writing changes")
     sync_parser.set_defaults(handler=cmd_ci_version_sync)

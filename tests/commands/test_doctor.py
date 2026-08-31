@@ -1,0 +1,1424 @@
+"""Tests for rrt doctor command."""
+
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+
+import pytest
+
+from repo_release_tools.commands import doctor
+from repo_release_tools.config import (
+    ArtifactProtection,
+    ConsumedArtifact,
+    DocsConfig,
+    EolConfig,
+    RrtConfig,
+    VersionGroup,
+    VersionTarget,
+)
+from repo_release_tools.ui import VerbosePrinter
+
+_ARGS = argparse.Namespace()
+
+
+def _make_config(
+    tmp_path: Path,
+    *,
+    autodetected: bool = False,
+    docs: DocsConfig | None = None,
+    eol: EolConfig | None = None,
+    artifact_protection: ArtifactProtection | None = None,
+) -> RrtConfig:
+    target = VersionTarget(
+        path=tmp_path / "src" / "pkg" / "__init__.py",
+        kind="python_version",
+    )
+    group = VersionGroup(
+        name="default",
+        release_branch="release/v{version}",
+        changelog_file=tmp_path / "CHANGELOG.md",
+        lock_command=[],
+        generated_files=[],
+        version_targets=[target],
+        pin_targets=[],
+    )
+    return RrtConfig(
+        root=tmp_path,
+        config_file=tmp_path / "pyproject.toml",
+        version_groups=[group],
+        default_group_name="default",
+        autodetected=autodetected,
+        global_pin_targets=[],
+        docs=docs,
+        eol=eol,
+        artifact_protection=artifact_protection,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Config loading errors
+# ---------------------------------------------------------------------------
+
+
+def test_doctor_no_config_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Returns 1 and prints guidance when no config file is found."""
+    monkeypatch.chdir(tmp_path)
+
+    rc = doctor.cmd_doctor(_ARGS)
+
+    assert rc == 1
+    assert capsys.readouterr().err
+
+
+def test_doctor_no_rrt_section(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Returns 1 when config exists but has no [tool.rrt] section."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "pyproject.toml").write_text("[tool.something]\nfoo = 1\n", encoding="utf-8")
+
+    rc = doctor.cmd_doctor(_ARGS)
+
+    assert rc == 1
+    assert capsys.readouterr().err
+
+
+def test_doctor_generic_value_error_returns_1(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Unexpected ValueError is surfaced to stderr."""
+    monkeypatch.chdir(tmp_path)
+
+    def _boom(_: Path) -> RrtConfig:
+        raise ValueError("bad config")
+
+    monkeypatch.setattr(doctor, "load_or_autodetect_config", _boom)
+
+    rc = doctor.cmd_doctor(_ARGS)
+
+    assert rc == 1
+    assert "bad config" in capsys.readouterr().err
+
+
+def test_doctor_runtime_error_returns_1(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Runtime errors while loading config are surfaced to stderr."""
+    monkeypatch.chdir(tmp_path)
+
+    def _boom(_: Path) -> RrtConfig:
+        raise RuntimeError("broken runtime")
+
+    monkeypatch.setattr(doctor, "load_or_autodetect_config", _boom)
+
+    rc = doctor.cmd_doctor(_ARGS)
+
+    assert rc == 1
+    assert "broken runtime" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# Happy path
+# ---------------------------------------------------------------------------
+
+
+def test_doctor_all_healthy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Returns 0 and reports core automation warnings as non-fatal."""
+    monkeypatch.chdir(tmp_path)
+    conf = _make_config(tmp_path)
+    monkeypatch.setattr(doctor, "load_or_autodetect_config", lambda _: conf)
+
+    rc = doctor.cmd_doctor(_ARGS)
+
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "rrt doctor" in out
+    assert "Core automation checks passed" in out
+    assert "rrt release check" in out
+
+
+def test_doctor_panel_shows_config_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Panel header shows the config file path."""
+    monkeypatch.chdir(tmp_path)
+    conf = _make_config(tmp_path)
+    monkeypatch.setattr(doctor, "load_or_autodetect_config", lambda _: conf)
+
+    doctor.cmd_doctor(_ARGS)
+
+    out = capsys.readouterr().out
+    assert "pyproject.toml" in out
+
+
+def test_doctor_panel_shows_group_count(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Panel header shows version group count."""
+    monkeypatch.chdir(tmp_path)
+    conf = _make_config(tmp_path)
+    monkeypatch.setattr(doctor, "load_or_autodetect_config", lambda _: conf)
+
+    doctor.cmd_doctor(_ARGS)
+
+    out = capsys.readouterr().out
+    assert "1 group" in out
+
+
+def test_doctor_autodetected_warns(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Autodetected config prints a warning to stderr."""
+    monkeypatch.chdir(tmp_path)
+    conf = _make_config(tmp_path, autodetected=True)
+    monkeypatch.setattr(doctor, "load_or_autodetect_config", lambda _: conf)
+
+    doctor.cmd_doctor(_ARGS)
+
+    assert capsys.readouterr().err
+
+
+def test_doctor_pre_commit_surface_detected(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A repo-managed pre-commit config is reported as OK."""
+    monkeypatch.chdir(tmp_path)
+    conf = _make_config(tmp_path)
+    (tmp_path / ".pre-commit-config.yaml").write_text(
+        "repos:\n  - repo: https://github.com/Anselmoo/repo-release-tools\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(doctor, "load_or_autodetect_config", lambda _: conf)
+
+    rc = doctor.cmd_doctor(_ARGS)
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "includes repo-release-tools hooks" in out
+
+
+def test_doctor_missing_alternative_hook_managers_are_obsolete(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A configured hook manager makes missing alternatives obsolete, not warnings."""
+    monkeypatch.chdir(tmp_path)
+    conf = _make_config(tmp_path)
+    (tmp_path / ".pre-commit-config.yaml").write_text(
+        "repos:\n  - repo: https://github.com/Anselmoo/repo-release-tools\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(doctor, "load_or_autodetect_config", lambda _: conf)
+
+    rc = doctor.cmd_doctor(_ARGS)
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "lefthook.yml not configured (obsolete: pre_commit already configured)" in out
+    assert ".husky not configured (obsolete: pre_commit already configured)" in out
+
+
+def test_doctor_existing_alternative_hook_manager_without_markers_still_warns(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Existing alternative hook config still warns when it lacks rrt markers."""
+    monkeypatch.chdir(tmp_path)
+    conf = _make_config(tmp_path)
+    (tmp_path / ".pre-commit-config.yaml").write_text(
+        "repos:\n  - repo: https://github.com/Anselmoo/repo-release-tools\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "lefthook.yml").write_text(
+        "pre-commit:\n  commands:\n    lint:\n      run: pytest\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(doctor, "load_or_autodetect_config", lambda _: conf)
+
+    rc = doctor.cmd_doctor(_ARGS)
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "lefthook.yml exists but no repo-release-tools hooks were detected" in out
+    assert "lefthook.yml not configured (obsolete:" not in out
+
+
+def test_doctor_pre_commit_surface_missing_markers_warns(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A generic pre-commit config warns but does not fail doctor."""
+    monkeypatch.chdir(tmp_path)
+    conf = _make_config(tmp_path)
+    (tmp_path / ".pre-commit-config.yaml").write_text(
+        "repos:\n  - repo: https://github.com/pre-commit/pre-commit-hooks\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(doctor, "load_or_autodetect_config", lambda _: conf)
+
+    rc = doctor.cmd_doctor(_ARGS)
+
+    assert rc == 0
+    assert "no repo-release-tools hooks were detected" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# Core automation checks
+# ---------------------------------------------------------------------------
+
+
+def test_doctor_lefthook_surface_detected(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A lefthook config with rrt-hooks is reported as OK."""
+    monkeypatch.chdir(tmp_path)
+    conf = _make_config(tmp_path)
+    (tmp_path / "lefthook.yml").write_text(
+        "pre-commit:\n  commands:\n    lint:\n      run: rrt-hooks pre-commit\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(doctor, "load_or_autodetect_config", lambda _: conf)
+
+    rc = doctor.cmd_doctor(_ARGS)
+
+    assert rc == 0
+    assert "lefthook.yml includes repo-release-tools hooks" in capsys.readouterr().out
+
+
+def test_doctor_husky_surface_detected(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A Husky hook script with rrt-hooks is reported as OK."""
+    monkeypatch.chdir(tmp_path)
+    conf = _make_config(tmp_path)
+    husky_dir = tmp_path / ".husky"
+    husky_dir.mkdir()
+    (husky_dir / "pre-commit").write_text("rrt-hooks pre-commit\n", encoding="utf-8")
+    monkeypatch.setattr(doctor, "load_or_autodetect_config", lambda _: conf)
+
+    rc = doctor.cmd_doctor(_ARGS)
+
+    assert rc == 0
+    assert ".husky includes repo-release-tools hooks (pre-commit)" in capsys.readouterr().out
+
+
+def test_doctor_husky_surface_missing_markers_warns(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A Husky hook script without rrt markers warns but does not fail doctor."""
+    monkeypatch.chdir(tmp_path)
+    conf = _make_config(tmp_path)
+    husky_dir = tmp_path / ".husky"
+    husky_dir.mkdir()
+    (husky_dir / "pre-commit").write_text("npm test\n", encoding="utf-8")
+    monkeypatch.setattr(doctor, "load_or_autodetect_config", lambda _: conf)
+
+    rc = doctor.cmd_doctor(_ARGS)
+
+    assert rc == 0
+    assert "no repo-release-tools hooks were detected" in capsys.readouterr().out
+
+
+def test_doctor_husky_dir_without_hook_scripts_warns(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A Husky directory without top-level hook scripts warns but does not fail doctor."""
+    monkeypatch.chdir(tmp_path)
+    conf = _make_config(tmp_path)
+    (tmp_path / ".husky" / "_").mkdir(parents=True)
+    monkeypatch.setattr(doctor, "load_or_autodetect_config", lambda _: conf)
+
+    rc = doctor.cmd_doctor(_ARGS)
+
+    assert rc == 0
+    assert ".husky contains no hook scripts" in capsys.readouterr().out
+
+
+def test_doctor_husky_dir_unreadable_returns_1(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """.husky exists as a file (not a directory) so iterdir() raises OSError — doctor fails."""
+    monkeypatch.chdir(tmp_path)
+    conf = _make_config(tmp_path)
+    # Create .husky as a regular file; iterdir() on a file raises NotADirectoryError (OSError)
+    (tmp_path / ".husky").write_text("not a directory\n", encoding="utf-8")
+    monkeypatch.setattr(doctor, "load_or_autodetect_config", lambda _: conf)
+
+    rc = doctor.cmd_doctor(_ARGS)
+
+    assert rc == 1
+    out = capsys.readouterr().out
+    assert ".husky unreadable" in out
+    assert "One or more core automation checks failed" in out
+
+
+def test_doctor_husky_hook_file_unreadable_returns_1(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A hook file inside .husky that cannot be read causes doctor to fail."""
+    monkeypatch.chdir(tmp_path)
+    conf = _make_config(tmp_path)
+    husky_dir = tmp_path / ".husky"
+    husky_dir.mkdir()
+    (husky_dir / "pre-commit").write_text("rrt-hooks pre-commit\n", encoding="utf-8")
+    monkeypatch.setattr(doctor, "load_or_autodetect_config", lambda _: conf)
+    # Patch _read_text so reading any hook file raises OSError
+    monkeypatch.setattr(
+        doctor, "_read_text", lambda _path: (_ for _ in ()).throw(OSError("permission denied"))
+    )
+
+    rc = doctor.cmd_doctor(_ARGS)
+
+    assert rc == 1
+    out = capsys.readouterr().out
+    assert "pre-commit unreadable" in out
+    assert "One or more core automation checks failed" in out
+
+
+def test_doctor_github_actions_surface_detected(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A workflow using repo-release-tools is reported as OK."""
+    monkeypatch.chdir(tmp_path)
+    conf = _make_config(tmp_path)
+    workflow_dir = tmp_path / ".github" / "workflows"
+    workflow_dir.mkdir(parents=True)
+    (workflow_dir / "ci.yml").write_text(
+        "uses: Anselmoo/repo-release-tools@v1.1.0\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(doctor, "load_or_autodetect_config", lambda _: conf)
+
+    rc = doctor.cmd_doctor(_ARGS)
+
+    assert rc == 0
+    assert "includes repo-release-tools policy checks" in capsys.readouterr().out
+
+
+def test_doctor_github_actions_surface_without_rrt_markers_warns(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A generic workflow file warns when no repo-release-tools step is present."""
+    monkeypatch.chdir(tmp_path)
+    conf = _make_config(tmp_path)
+    workflow_dir = tmp_path / ".github" / "workflows"
+    workflow_dir.mkdir(parents=True)
+    (workflow_dir / "ci.yml").write_text("uses: actions/checkout@v6\n", encoding="utf-8")
+    monkeypatch.setattr(doctor, "load_or_autodetect_config", lambda _: conf)
+
+    rc = doctor.cmd_doctor(_ARGS)
+
+    assert rc == 0
+    assert "no repo-release-tools policy step detected" in capsys.readouterr().out
+
+
+def test_doctor_empty_workflows_dir_warns(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """An empty workflows directory warns but does not fail doctor."""
+    monkeypatch.chdir(tmp_path)
+    conf = _make_config(tmp_path)
+    (tmp_path / ".github" / "workflows").mkdir(parents=True)
+    monkeypatch.setattr(doctor, "load_or_autodetect_config", lambda _: conf)
+
+    rc = doctor.cmd_doctor(_ARGS)
+
+    assert rc == 0
+    assert "contains no workflow files" in capsys.readouterr().out
+
+
+def test_doctor_unreadable_workflow_file_returns_1(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Unreadable workflow entries fail doctor."""
+    monkeypatch.chdir(tmp_path)
+    conf = _make_config(tmp_path)
+    workflow_dir = tmp_path / ".github" / "workflows"
+    workflow_dir.mkdir(parents=True)
+    (workflow_dir / "ci.yml").mkdir()
+    monkeypatch.setattr(doctor, "load_or_autodetect_config", lambda _: conf)
+
+    rc = doctor.cmd_doctor(_ARGS)
+
+    assert rc == 1
+    assert "ci.yml unreadable" in capsys.readouterr().out
+
+
+def test_doctor_unreadable_automation_file_returns_1(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Unreadable automation files fail doctor."""
+    monkeypatch.chdir(tmp_path)
+    conf = _make_config(tmp_path)
+    (tmp_path / ".pre-commit-config.yaml").mkdir()
+    monkeypatch.setattr(doctor, "load_or_autodetect_config", lambda _: conf)
+
+    rc = doctor.cmd_doctor(_ARGS)
+
+    assert rc == 1
+    out = capsys.readouterr().out
+    assert "unreadable" in out
+    assert "One or more core automation checks failed" in out
+
+
+def test_doctor_feature_specific_hints_follow_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Doctor points configured features to their dedicated commands."""
+    monkeypatch.chdir(tmp_path)
+    docs = DocsConfig(lock_file=".rrt/docs.lock.toml", src_dir="src")
+    eol = EolConfig(
+        languages=("python",),
+        warn_days=180,
+        error_days=0,
+        fetch_live=False,
+        allow_eol=False,
+        overrides=(),
+    )
+    conf = _make_config(tmp_path, docs=docs, eol=eol)
+    monkeypatch.setattr(doctor, "load_or_autodetect_config", lambda _: conf)
+
+    doctor.cmd_doctor(_ARGS)
+
+    out = capsys.readouterr().out
+    assert "rrt docs check" in out
+    assert "rrt eol" in out
+
+
+# ---------------------------------------------------------------------------
+# --fix and --fix-dry-run tests
+# ---------------------------------------------------------------------------
+
+
+def _args_fix(*, fix: bool = False, fix_dry_run: bool = False) -> argparse.Namespace:
+    return argparse.Namespace(fix=fix, fix_dry_run=fix_dry_run)
+
+
+def test_doctor_fix_inserts_missing_unreleased(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """--fix adds [Unreleased] section when changelog exists but is missing it."""
+    monkeypatch.chdir(tmp_path)
+    conf = _make_config(tmp_path)
+    changelog = conf.resolve_group().changelog_file
+    changelog.write_text("## [1.0.0] - 2025-01-01\n\n### Added\n- initial\n", encoding="utf-8")
+    monkeypatch.setattr(doctor, "load_or_autodetect_config", lambda _: conf)
+
+    rc = doctor.cmd_doctor(_args_fix(fix=True))
+
+    assert rc == 0
+    result = changelog.read_text(encoding="utf-8")
+    assert "## [Unreleased]" in result
+    out = capsys.readouterr().out
+    assert "Inserted" in out
+
+
+def test_doctor_fix_dry_run_does_not_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """--fix-dry-run reports what would change without writing files."""
+    monkeypatch.chdir(tmp_path)
+    conf = _make_config(tmp_path)
+    changelog = conf.resolve_group().changelog_file
+    original = "## [1.0.0] - 2025-01-01\n\n### Added\n- initial\n"
+    changelog.write_text(original, encoding="utf-8")
+    monkeypatch.setattr(doctor, "load_or_autodetect_config", lambda _: conf)
+
+    rc = doctor.cmd_doctor(_args_fix(fix_dry_run=True))
+
+    assert rc == 0
+    assert changelog.read_text(encoding="utf-8") == original
+    out = capsys.readouterr().out
+    assert "Would insert" in out
+
+
+def test_doctor_fix_nothing_to_fix(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """--fix reports 'nothing to fix' when everything is already correct."""
+    monkeypatch.chdir(tmp_path)
+    conf = _make_config(tmp_path)
+    changelog = conf.resolve_group().changelog_file
+    changelog.write_text("## [Unreleased]\n\n## [1.0.0] - 2025-01-01\n", encoding="utf-8")
+    monkeypatch.setattr(doctor, "load_or_autodetect_config", lambda _: conf)
+
+    rc = doctor.cmd_doctor(_args_fix(fix=True))
+
+    assert rc == 0
+    assert "Nothing to fix" in capsys.readouterr().out
+
+
+def test_doctor_fix_no_changelog_file_skips_gracefully(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """--fix silently skips groups whose changelog file does not exist."""
+    monkeypatch.chdir(tmp_path)
+    conf = _make_config(tmp_path)
+    # Changelog file intentionally not created
+    monkeypatch.setattr(doctor, "load_or_autodetect_config", lambda _: conf)
+
+    rc = doctor.cmd_doctor(_args_fix(fix=True))
+
+    assert rc == 0
+    assert "Nothing to fix" in capsys.readouterr().out
+
+
+def test_fix_missing_unreleased_ignores_non_rrt_config(tmp_path: Path) -> None:
+    """_fix_missing_unreleased returns empty list for non-RrtConfig input."""
+    from repo_release_tools.commands.doctor import _fix_missing_unreleased
+
+    result = _fix_missing_unreleased(tmp_path, object(), dry_run=False)
+    assert result == []
+
+
+def test_doctor_fix_rst_changelog(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """--fix inserts RST-format Unreleased section into .rst changelogs."""
+    monkeypatch.chdir(tmp_path)
+    from repo_release_tools.config import VersionGroup, VersionTarget
+
+    init_file = tmp_path / "src" / "__init__.py"
+    init_file.parent.mkdir(parents=True, exist_ok=True)
+    init_file.write_text('__version__ = "1.0.0"\n', encoding="utf-8")
+    changelog = tmp_path / "CHANGELOG.rst"
+    changelog.write_text("1.0.0\n-----\n\n- initial\n", encoding="utf-8")
+
+    from repo_release_tools.config import RrtConfig
+
+    group = VersionGroup(
+        name="default",
+        release_branch="release/v{version}",
+        changelog_file=changelog,
+        lock_command=[],
+        generated_files=[],
+        version_targets=[VersionTarget(path=init_file, kind="python_version")],
+        pin_targets=[],
+    )
+    conf = RrtConfig(
+        root=tmp_path,
+        config_file=tmp_path / "pyproject.toml",
+        version_groups=[group],
+        default_group_name="default",
+    )
+    monkeypatch.setattr(doctor, "load_or_autodetect_config", lambda _: conf)
+
+    rc = doctor.cmd_doctor(_args_fix(fix=True))
+
+    assert rc == 0
+    result = changelog.read_text(encoding="utf-8")
+    assert "Unreleased" in result
+    assert "--------" in result
+
+
+# ---------------------------------------------------------------------------
+# --snapshot / --check / --strict
+# ---------------------------------------------------------------------------
+
+
+def _args_snapshot(
+    *, snapshot: bool = False, check: bool = False, strict: bool = False
+) -> argparse.Namespace:
+    return argparse.Namespace(snapshot=snapshot, check=check, strict=strict)
+
+
+def test_doctor_snapshot_writes_health_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """--snapshot writes .rrt/health.lock.toml and exits 0."""
+    monkeypatch.chdir(tmp_path)
+    conf = _make_config(tmp_path)
+    monkeypatch.setattr(doctor, "load_or_autodetect_config", lambda _: conf)
+
+    rc = doctor.cmd_doctor(_args_snapshot(snapshot=True))
+
+    assert rc == 0
+    lock_path = tmp_path / ".rrt" / "health.lock.toml"
+    assert lock_path.exists()
+    import tomllib
+
+    data = tomllib.loads(lock_path.read_text())
+    assert "meta" in data
+    assert "checks" in data
+    assert "pre_commit" in data["checks"]
+
+
+def test_doctor_snapshot_writes_obsolete_hook_status(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Snapshots preserve obsolete hook-manager status."""
+    monkeypatch.chdir(tmp_path)
+    conf = _make_config(tmp_path)
+    (tmp_path / ".pre-commit-config.yaml").write_text(
+        "repos:\n  - repo: https://github.com/Anselmoo/repo-release-tools\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(doctor, "load_or_autodetect_config", lambda _: conf)
+
+    rc = doctor.cmd_doctor(_args_snapshot(snapshot=True))
+
+    assert rc == 0
+    import tomllib
+
+    data = tomllib.loads((tmp_path / ".rrt" / "health.lock.toml").read_text())
+    assert data["checks"]["lefthook"]["status"] == "obsolete"
+    assert data["checks"]["husky"]["status"] == "obsolete"
+
+
+def test_doctor_check_exits_0_when_no_regression(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """--check exits 0 when check statuses match the snapshot."""
+    monkeypatch.chdir(tmp_path)
+    conf = _make_config(tmp_path)
+    monkeypatch.setattr(doctor, "load_or_autodetect_config", lambda _: conf)
+
+    # Write baseline first
+    doctor.cmd_doctor(_args_snapshot(snapshot=True))
+    # Check against the same baseline
+    rc = doctor.cmd_doctor(_args_snapshot(check=True))
+
+    assert rc == 0
+
+
+def test_doctor_check_advisory_exits_0_on_regression(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """--check without --strict exits 0 even when regression found."""
+    from repo_release_tools.state import build_health_lock, write_lock
+
+    monkeypatch.chdir(tmp_path)
+    conf = _make_config(tmp_path)
+    monkeypatch.setattr(doctor, "load_or_autodetect_config", lambda _: conf)
+
+    # Write a snapshot with all checks as "ok"
+    lock_path = tmp_path / ".rrt" / "health.lock.toml"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    write_lock(
+        lock_path,
+        build_health_lock(
+            [
+                {"name": "pre_commit", "status": "ok"},
+                {"name": "lefthook", "status": "ok"},
+                {"name": "husky", "status": "ok"},
+                {"name": "workflows", "status": "ok"},
+            ]
+        ),
+    )
+
+    rc = doctor.cmd_doctor(_args_snapshot(check=True))
+
+    # Advisory: may detect regressions (missing markers etc.) but exits 0
+    assert rc == 0
+    out = capsys.readouterr().out
+    # Either "no regressions" or advisory warning — both are exit 0
+    assert "regression" in out.lower() or "No health regressions" in out
+
+
+def test_doctor_check_strict_exits_1_on_regression(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """--check --strict exits 1 when a regression is detected and shows snapshot recommendation."""
+    from repo_release_tools.state import build_health_lock, write_lock
+
+    monkeypatch.chdir(tmp_path)
+    conf = _make_config(tmp_path)
+    monkeypatch.setattr(doctor, "load_or_autodetect_config", lambda _: conf)
+
+    # Write a snapshot where pre_commit was "ok" (better than real state)
+    lock_path = tmp_path / ".rrt" / "health.lock.toml"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    write_lock(
+        lock_path,
+        build_health_lock(
+            [
+                {"name": "pre_commit", "status": "ok"},
+                {"name": "lefthook", "status": "ok"},
+                {"name": "husky", "status": "ok"},
+                {"name": "workflows", "status": "ok"},
+            ]
+        ),
+    )
+
+    # In tmp_path there's no .pre-commit-config.yaml → actual check will be "warning"
+    rc = doctor.cmd_doctor(_args_snapshot(check=True, strict=True))
+
+    # Strict mode: regression found → exit 1
+    assert rc == 1
+    assert "rrt doctor --snapshot" in capsys.readouterr().err
+
+
+def test_doctor_check_missing_lock_exits_1_strict(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """--check --strict exits 1 when no health.lock.toml exists (no baseline)."""
+    monkeypatch.chdir(tmp_path)
+    conf = _make_config(tmp_path)
+    monkeypatch.setattr(doctor, "load_or_autodetect_config", lambda _: conf)
+
+    rc = doctor.cmd_doctor(_args_snapshot(check=True, strict=True))
+
+    assert rc == 1
+
+
+def test_doctor_verbose_emits_level1_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """verbose=1 emits check-level summary lines to stderr."""
+    monkeypatch.chdir(tmp_path)
+    conf = _make_config(tmp_path)
+    monkeypatch.setattr(doctor, "load_or_autodetect_config", lambda _: conf)
+
+    args = argparse.Namespace(
+        fix=False, fix_dry_run=False, snapshot=False, check=False, strict=False, verbose=1
+    )
+    rc = doctor.cmd_doctor(args)
+
+    assert rc == 0
+    err = capsys.readouterr().err
+    assert "doctor:" in err
+    assert "pre_commit:" in err
+
+
+# ---------------------------------------------------------------------------
+# Direct extraction tests: Options.from_args / _render_doctor_report
+# ---------------------------------------------------------------------------
+
+
+def test_options_from_args_sparse_namespace_uses_defaults() -> None:
+    """A Namespace missing every attribute falls back to Options' documented defaults."""
+    opts = doctor.Options.from_args(argparse.Namespace())
+
+    assert opts == doctor.Options(
+        fix=False,
+        fix_dry_run=False,
+        snapshot=False,
+        check=False,
+        strict=False,
+        verbose=0,
+    )
+
+
+def test_options_from_args_reads_explicit_values() -> None:
+    """Every flag on a fully-populated Namespace is read through, unchanged."""
+    args = argparse.Namespace(
+        fix=True,
+        fix_dry_run=True,
+        snapshot=True,
+        check=True,
+        strict=True,
+        verbose=2,
+    )
+
+    opts = doctor.Options.from_args(args)
+
+    assert opts == doctor.Options(
+        fix=True,
+        fix_dry_run=True,
+        snapshot=True,
+        check=True,
+        strict=True,
+        verbose=2,
+    )
+
+
+def test_render_doctor_report_all_ok_returns_true(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """All-ok checks render as passed and the helper returns True."""
+    p = VerbosePrinter()
+    conf = _make_config(tmp_path)
+    named_checks = [
+        ("pre_commit", (".pre-commit-config.yaml includes repo-release-tools hooks", True, "ok")),
+        ("lefthook", ("lefthook.yml not configured", True, "warning")),
+    ]
+
+    all_ok = doctor._render_doctor_report(p, named_checks, conf)
+
+    assert all_ok is True
+    out = capsys.readouterr().out
+    assert "Core automation checks passed." in out
+    assert "rrt release check" in out
+
+
+def test_render_doctor_report_failure_returns_false_and_gates_feature_hints(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A non-ok/obsolete/warning severity flips all_ok False; docs/eol hints follow config."""
+    p = VerbosePrinter()
+    conf = _make_config(tmp_path, docs=None, eol=None)
+    named_checks = [
+        ("workflows", ("workflow.yml unreadable: boom", False, "error")),
+        ("husky", (".husky includes repo-release-tools hooks (pre-commit)", True, "obsolete")),
+    ]
+
+    all_ok = doctor._render_doctor_report(p, named_checks, conf)
+
+    assert all_ok is False
+    out = capsys.readouterr().out
+    assert "One or more core automation checks failed." in out
+    assert "rrt docs check" not in out
+    assert "rrt eol" not in out
+
+
+# ---------------------------------------------------------------------------
+# _check_artifact_protection: the artifact-protection lens
+# ---------------------------------------------------------------------------
+
+# `?job=` value carries colons on purpose — mirrors the real motivating case
+# (`build:report_html:bundle`) and pins that the scanner/lens never
+# split/normalize `job`.
+_GITLAB_FETCH_SNIPPET = (
+    "build:docs:\n"
+    "  script:\n"
+    '    - curl "https://example.com/api/v4/projects/1/jobs/artifacts/main/raw/'
+    'artifacts/manifest.json?job=build:report_html:bundle" --output out.json\n'
+)
+
+
+def test_check_artifact_protection_no_fetches_no_config_object_warns(tmp_path: Path) -> None:
+    """No CI fetches and config=None (not just an absent section) warns 'not configured'."""
+    message, ok, severity = doctor._check_artifact_protection(tmp_path, None)
+
+    assert ok is True
+    assert severity == "warning"
+    assert message == doctor._ARTIFACT_PROTECTION_NOT_CONFIGURED
+
+
+def test_check_artifact_protection_no_fetches_section_absent_warns(tmp_path: Path) -> None:
+    """No CI fetches and a resolved config with no [tool.rrt.artifact_protection] warns."""
+    conf = _make_config(tmp_path)
+
+    message, ok, severity = doctor._check_artifact_protection(tmp_path, conf)
+
+    assert ok is True
+    assert severity == "warning"
+    assert "not configured" in message
+
+
+def test_check_artifact_protection_undeclared_fetch_fails_with_file_and_line(
+    tmp_path: Path,
+) -> None:
+    """A fetch with no matching `consumed` entry fails and names the fetch's file:line."""
+    (tmp_path / ".gitlab-ci.yml").write_text(_GITLAB_FETCH_SNIPPET, encoding="utf-8")
+    conf = _make_config(tmp_path, artifact_protection=ArtifactProtection(consumed=()))
+
+    message, ok, severity = doctor._check_artifact_protection(tmp_path, conf)
+
+    assert ok is False
+    assert severity == "error"
+    # Load-bearing: the file and line of the offending fetch, not just the job name.
+    assert ".gitlab-ci.yml:3" in message
+    assert "build:report_html:bundle" in message
+    # The exact TOML block to add.
+    assert "[[tool.rrt.artifact_protection.consumed]]" in message
+    assert 'job = "build:report_html:bundle"' in message
+    assert 'ref = "main"' in message
+    assert 'artifacts = ["artifacts/manifest.json"]' in message
+    assert 'consumed_by = [".gitlab-ci.yml"]' in message
+
+
+def test_check_artifact_protection_undeclared_fetch_when_section_entirely_absent(
+    tmp_path: Path,
+) -> None:
+    """A fetch found with no [tool.rrt.artifact_protection] section at all still fails."""
+    (tmp_path / ".gitlab-ci.yml").write_text(_GITLAB_FETCH_SNIPPET, encoding="utf-8")
+    conf = _make_config(tmp_path)
+
+    message, ok, severity = doctor._check_artifact_protection(tmp_path, conf)
+
+    assert ok is False
+    assert severity == "error"
+    # Subject/verb agreement for the singular case: "1 ... fetch was found", not "were found".
+    assert "1 cross-pipeline artifact fetch was found in CI config" in message
+    assert "[tool.rrt.artifact_protection] is not configured, but" in message
+    assert ".gitlab-ci.yml:3" in message
+    assert "[[tool.rrt.artifact_protection.consumed]]" in message
+
+
+def test_check_artifact_protection_multiple_undeclared_fetches_lists_each(
+    tmp_path: Path,
+) -> None:
+    """Two undeclared fetches both appear, each with its own file:line and TOML block."""
+    (tmp_path / ".gitlab-ci.yml").write_text(_GITLAB_FETCH_SNIPPET, encoding="utf-8")
+    workflow_dir = tmp_path / ".github" / "workflows"
+    workflow_dir.mkdir(parents=True)
+    (workflow_dir / "ci.yml").write_text(
+        "jobs:\n"
+        "  publish:\n"
+        "    steps:\n"
+        "      - uses: actions/download-artifact@v4\n"
+        "        with:\n"
+        "          name: benchmark-report\n"
+        "          run-id: 12345\n",
+        encoding="utf-8",
+    )
+    conf = _make_config(tmp_path, artifact_protection=ArtifactProtection(consumed=()))
+
+    message, ok, severity = doctor._check_artifact_protection(tmp_path, conf)
+
+    assert ok is False
+    assert severity == "error"
+    assert "2 cross-pipeline artifact fetches not declared" in message
+    assert ".gitlab-ci.yml:3" in message
+    assert ".github/workflows/ci.yml:4" in message
+    assert 'job = "build:report_html:bundle"' in message
+    assert 'job = "benchmark-report"' in message
+    # GitHub-sourced fetches never carry a `path` (download-artifact exposes no
+    # per-file path), so `artifacts` must still come out non-empty — never `[]`,
+    # which would fail ConsumedArtifact.validate() if pasted verbatim — and the
+    # placeholder must be unmistakably marked for human completion, like `reason`.
+    assert 'artifacts = ["TODO: list the artifact-relative path(s) this job consumes"]' in message
+    assert "artifacts = []" not in message
+
+
+def test_check_artifact_protection_github_sourced_toml_block_is_valid_when_parsed(
+    tmp_path: Path,
+) -> None:
+    """The emitted block for a GitHub-sourced fetch parses into a valid ConsumedArtifact.
+
+    Regression test for a block that looked plausible but silently failed
+    `ConsumedArtifact.validate()` once pasted (empty `artifacts`).
+    """
+    workflow_dir = tmp_path / ".github" / "workflows"
+    workflow_dir.mkdir(parents=True)
+    (workflow_dir / "ci.yml").write_text(
+        "jobs:\n"
+        "  publish:\n"
+        "    steps:\n"
+        "      - uses: actions/download-artifact@v4\n"
+        "        with:\n"
+        "          name: benchmark-report\n"
+        "          run-id: 12345\n",
+        encoding="utf-8",
+    )
+    conf = _make_config(tmp_path, artifact_protection=ArtifactProtection(consumed=()))
+
+    message, ok, severity = doctor._check_artifact_protection(tmp_path, conf)
+    assert ok is False
+
+    # Extract the emitted TOML block from the message and confirm it round-trips
+    # through the real config loader path: parse -> construct -> validate.
+    toml_start = message.index("[[tool.rrt.artifact_protection.consumed]]")
+    block = message[toml_start:]
+    import tomllib
+
+    parsed = tomllib.loads(block)
+    entry = parsed["tool"]["rrt"]["artifact_protection"]["consumed"][0]
+    consumed = ConsumedArtifact(
+        job=entry["job"],
+        ref=entry["ref"],
+        artifacts=tuple(entry["artifacts"]),
+        consumed_by=tuple(entry["consumed_by"]),
+        reason=entry["reason"],
+    )
+
+    consumed.validate()  # must not raise
+
+    assert entry["job"] == "benchmark-report"
+    assert entry["artifacts"] == ["TODO: list the artifact-relative path(s) this job consumes"]
+
+
+def test_check_artifact_protection_quoted_github_values_declare_and_parse_cleanly(
+    tmp_path: Path,
+) -> None:
+    """A quoted `name:`/`run-id:` fetch matches a correctly declared entry and
+    round-trips through valid TOML end-to-end.
+
+    Regression: before the quote-stripping fix, the scanner recorded
+    `job='"build-output"'` / `ref='"12345"'` (quotes embedded), which made
+    this check *fail* against a config declaring the correct, unquoted
+    `job = "build-output"` / `ref = "12345"` — a loud false positive against
+    a correct declaration, not a silent all-clear — and the fix-it snippet it
+    printed contained invalid TOML (`job = ""build-output""`) that
+    `tomllib.loads` cannot parse.
+    """
+    workflow_dir = tmp_path / ".github" / "workflows"
+    workflow_dir.mkdir(parents=True)
+    (workflow_dir / "ci.yml").write_text(
+        "jobs:\n"
+        "  publish:\n"
+        "    steps:\n"
+        "      - uses: actions/download-artifact@v4\n"
+        "        with:\n"
+        '          name: "build-output"\n'
+        '          run-id: "12345"\n',
+        encoding="utf-8",
+    )
+    conf = _make_config(
+        tmp_path,
+        artifact_protection=ArtifactProtection(
+            consumed=(
+                ConsumedArtifact(
+                    job="build-output",
+                    ref="12345",
+                    artifacts=("dist/build-output.whl",),
+                    consumed_by=(".github/workflows/ci.yml",),
+                ),
+            ),
+        ),
+    )
+
+    message, ok, severity = doctor._check_artifact_protection(tmp_path, conf)
+
+    assert ok is True
+    assert severity == "ok"
+    assert 'job = ""build-output""' not in message
+
+
+def test_check_artifact_protection_undeclared_and_stale_both_surface_together(
+    tmp_path: Path,
+) -> None:
+    """An undeclared fetch and a stale `consumed` entry are both visible in one report.
+
+    Direction 1 (fail) must not silently mask direction 2 (warn) — a stale entry
+    should not go unseen for however many `rrt doctor` runs it takes to clear an
+    unrelated failure.
+    """
+    (tmp_path / ".gitlab-ci.yml").write_text(_GITLAB_FETCH_SNIPPET, encoding="utf-8")
+    conf = _make_config(
+        tmp_path,
+        artifact_protection=ArtifactProtection(
+            consumed=(
+                ConsumedArtifact(
+                    job="ghost-job",
+                    ref="main",
+                    artifacts=("a",),
+                    consumed_by=("b",),
+                ),
+            )
+        ),
+    )
+
+    message, ok, severity = doctor._check_artifact_protection(tmp_path, conf)
+
+    assert ok is False
+    assert severity == "error"
+    # Direction 1: the undeclared fetch is reported, with its file:line and fix.
+    assert ".gitlab-ci.yml:3" in message
+    assert "build:report_html:bundle" in message
+    # Direction 2: the stale entry is reported too, in the same message.
+    assert "ghost-job" in message
+    assert "matching no scanned CI fetch" in message
+
+
+def test_check_artifact_protection_stale_consumed_entry_warns(tmp_path: Path) -> None:
+    """A `consumed` entry matching no scanned fetch warns rather than passing silently."""
+    conf = _make_config(
+        tmp_path,
+        artifact_protection=ArtifactProtection(
+            consumed=(
+                ConsumedArtifact(
+                    job="build:report_html",
+                    ref="main",
+                    artifacts=("artifacts/manifest.json",),
+                    consumed_by=(".gitlab/65-docs.yml",),
+                ),
+            )
+        ),
+    )
+
+    message, ok, severity = doctor._check_artifact_protection(tmp_path, conf)
+
+    assert ok is True
+    assert severity == "warning"
+    assert "build:report_html" in message
+    assert "matching no scanned CI fetch" in message
+
+
+def test_check_artifact_protection_all_declared_clean_pass(tmp_path: Path) -> None:
+    """Every scanned fetch has a matching `consumed` entry: a clean, ok pass."""
+    (tmp_path / ".gitlab-ci.yml").write_text(_GITLAB_FETCH_SNIPPET, encoding="utf-8")
+    conf = _make_config(
+        tmp_path,
+        artifact_protection=ArtifactProtection(
+            consumed=(
+                ConsumedArtifact(
+                    job="build:report_html:bundle",
+                    ref="main",
+                    artifacts=("artifacts/manifest.json",),
+                    consumed_by=(".gitlab-ci.yml",),
+                ),
+            )
+        ),
+    )
+
+    message, ok, severity = doctor._check_artifact_protection(tmp_path, conf)
+
+    assert ok is True
+    assert severity == "ok"
+    assert "All 1 cross-pipeline artifact fetch declared" in message
+
+
+def test_check_artifact_protection_configured_with_no_fetches_is_ok(tmp_path: Path) -> None:
+    """A configured section with nothing to declare and nothing scanned is a clean ok."""
+    conf = _make_config(
+        tmp_path,
+        artifact_protection=ArtifactProtection(protected_refs=("main",)),
+    )
+
+    message, ok, severity = doctor._check_artifact_protection(tmp_path, conf)
+
+    assert ok is True
+    assert severity == "ok"
+    assert "declares no consumed artifacts to check" in message
+
+
+# ---------------------------------------------------------------------------
+# Regression: the join key is (job, ref) [+ path when known], never job alone
+# ---------------------------------------------------------------------------
+
+
+def test_check_artifact_protection_same_job_different_ref_is_still_undeclared(
+    tmp_path: Path,
+) -> None:
+    """A declared (job, ref) entry must not mask an undeclared fetch of the same
+    job at a DIFFERENT ref.
+
+    Regression for the job-collision false negative: before the fix, matching
+    was on `job` alone, so a fetch at `ref=staging` of a different path was
+    reported as declared merely because some other, unrelated fetch at
+    `ref=main` shares the job string.
+    """
+    (tmp_path / ".gitlab-ci.yml").write_text(
+        "build:report_html:\n"
+        "  script:\n"
+        '    - curl ".../jobs/artifacts/main/raw/manifest.json?job=build:report_html"\n',
+        encoding="utf-8",
+    )
+    (tmp_path / ".gitlab").mkdir()
+    (tmp_path / ".gitlab" / "other.yml").write_text(
+        "other:job:\n"
+        "  script:\n"
+        '    - curl ".../jobs/artifacts/staging/raw/secret-config.json?job=build:report_html"\n',
+        encoding="utf-8",
+    )
+    conf = _make_config(
+        tmp_path,
+        artifact_protection=ArtifactProtection(
+            consumed=(
+                ConsumedArtifact(
+                    job="build:report_html",
+                    ref="main",
+                    artifacts=("manifest.json",),
+                    consumed_by=(".gitlab-ci.yml",),
+                ),
+            )
+        ),
+    )
+
+    message, ok, severity = doctor._check_artifact_protection(tmp_path, conf)
+
+    assert ok is False
+    assert severity == "error"
+    # The ref=main fetch is properly declared and must not appear as undeclared.
+    assert ".gitlab-ci.yml:3" not in message
+    # The ref=staging fetch of a DIFFERENT path is not covered by the ref=main
+    # entry and must be reported.
+    assert ".gitlab/other.yml:3" in message
+    assert 'ref = "staging"' in message
+    assert 'artifacts = ["secret-config.json"]' in message
+
+
+def test_check_artifact_protection_same_job_ref_different_path_is_still_undeclared(
+    tmp_path: Path,
+) -> None:
+    """A declared entry whose `artifacts` does not include the fetched path must
+    not cover that fetch, even when `job` and `ref` both match.
+
+    Regression: declaring "job X at ref Y protects artifacts [a, b]" must not
+    silently protect a fetch of a different artifact `c` from that same job
+    and ref.
+    """
+    (tmp_path / ".gitlab-ci.yml").write_text(
+        "build:report_html:\n"
+        "  script:\n"
+        '    - curl ".../jobs/artifacts/main/raw/other-path.json?job=build:report_html"\n',
+        encoding="utf-8",
+    )
+    conf = _make_config(
+        tmp_path,
+        artifact_protection=ArtifactProtection(
+            consumed=(
+                ConsumedArtifact(
+                    job="build:report_html",
+                    ref="main",
+                    artifacts=("manifest.json",),  # does NOT include other-path.json
+                    consumed_by=(".gitlab-ci.yml",),
+                ),
+            )
+        ),
+    )
+
+    message, ok, severity = doctor._check_artifact_protection(tmp_path, conf)
+
+    assert ok is False
+    assert severity == "error"
+    assert ".gitlab-ci.yml:3" in message
+    assert 'artifacts = ["other-path.json"]' in message
+
+
+def test_check_artifact_protection_github_download_all_marker_is_declarable(
+    tmp_path: Path,
+) -> None:
+    """A `run-id`-without-`name` fetch (job == '*') is visible when undeclared
+    and can be declared with `job = "*"` to clear the check — closing the loop
+    on the scanner-level regression that this fetch is recorded at all.
+    """
+    workflow_dir = tmp_path / ".github" / "workflows"
+    workflow_dir.mkdir(parents=True)
+    workflow_dir_content = (
+        "jobs:\n"
+        "  publish:\n"
+        "    steps:\n"
+        "      - uses: actions/download-artifact@v4\n"
+        "        with:\n"
+        "          run-id: 999\n"
+    )
+    (workflow_dir / "ci.yml").write_text(workflow_dir_content, encoding="utf-8")
+
+    # Undeclared: visible as an error naming the download-all marker.
+    undeclared_conf = _make_config(tmp_path, artifact_protection=ArtifactProtection(consumed=()))
+    message, ok, severity = doctor._check_artifact_protection(tmp_path, undeclared_conf)
+    assert ok is False
+    assert severity == "error"
+    assert "'*'" in message
+    assert 'job = "*"' in message
+
+    # Declared with job = "*": the check clears.
+    declared_conf = _make_config(
+        tmp_path,
+        artifact_protection=ArtifactProtection(
+            consumed=(
+                ConsumedArtifact(
+                    job="*",
+                    ref="999",
+                    artifacts=("all artifacts from run 999",),
+                    consumed_by=(".github/workflows/ci.yml",),
+                ),
+            )
+        ),
+    )
+    message, ok, severity = doctor._check_artifact_protection(tmp_path, declared_conf)
+    assert ok is True
+    assert severity == "ok"
+
+
+def test_doctor_artifact_protection_undeclared_fetch_fails_doctor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """An undeclared cross-pipeline fetch makes `rrt doctor` fail end-to-end."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".gitlab-ci.yml").write_text(_GITLAB_FETCH_SNIPPET, encoding="utf-8")
+    conf = _make_config(tmp_path, artifact_protection=ArtifactProtection(consumed=()))
+    monkeypatch.setattr(doctor, "load_or_autodetect_config", lambda _: conf)
+
+    rc = doctor.cmd_doctor(_ARGS)
+
+    assert rc == 1
+    out = capsys.readouterr().out
+    assert ".gitlab-ci.yml:3" in out
+    assert "[[tool.rrt.artifact_protection.consumed]]" in out
+
+
+def test_doctor_artifact_protection_stale_entry_warns_doctor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A stale `consumed` entry warns but does not fail `rrt doctor`."""
+    monkeypatch.chdir(tmp_path)
+    conf = _make_config(
+        tmp_path,
+        artifact_protection=ArtifactProtection(
+            consumed=(
+                ConsumedArtifact(
+                    job="ghost-job",
+                    ref="main",
+                    artifacts=("a",),
+                    consumed_by=("b",),
+                ),
+            )
+        ),
+    )
+    monkeypatch.setattr(doctor, "load_or_autodetect_config", lambda _: conf)
+
+    rc = doctor.cmd_doctor(_ARGS)
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "ghost-job" in out
+    assert "matching no scanned CI fetch" in out

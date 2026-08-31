@@ -1,5 +1,5 @@
-# Sample workflow for building and deploying a Jekyll site to GitHub Pages
-name: Deploy Jekyll with GitHub Pages dependencies preinstalled
+# Sample workflow for building and deploying an Astro site to GitHub Pages
+name: 📖 Deploy docs to GitHub Pages
 
 on:
   # Runs on pushes targeting the default branch
@@ -22,28 +22,72 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  # Build job
-  build:
+  # Verify job: lock-based drift checks before building
+  verify:
+    name: ✅ Verify
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+      - name: Set up uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d  # v10.0.1
+        with:
+          enable-cache: true
+      - name: Install dependencies
+        run: uv sync --all-groups
+      - name: Check docs lock drift
+        run: uv run rrt docs publish --check
+      - name: Check docs inject drift
+        run: uv run rrt docs inject --check
+      - name: Check health regressions
+        run: uv run rrt doctor --check --strict
+      - name: Check tree structure drift
+        run: uv run rrt tree --check --strict --strict-empty-dirs
+      - name: Generate badge SVGs for artifact check
+        run: uv run python -m repo_release_tools.assets.badges src/repo_release_tools/assets/badges
+      - name: Check artifact integrity
+        run: uv run rrt artifacts --check --strict
+
+  # Build job
+  build:
+    name: 🏗️ Build
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+      - name: Set up uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d  # v10.0.1
+        with:
+          enable-cache: true
+      - name: Install dependencies
+        run: uv sync --all-groups
+      - name: Generate docs badge assets
+        run: uv run python -m repo_release_tools.assets.badges docs/public/assets/badges
       - name: Setup Pages
-        uses: actions/configure-pages@v5
+        uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d  # v6
         with:
           enablement: true
-      - name: Build with Jekyll
-        uses: actions/jekyll-build-pages@v1
+      - name: Setup Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7
         with:
-          source: ./docs
-          destination: ./_site
+          node-version: 24
+          cache: npm
+          cache-dependency-path: docs/package-lock.json
+      - name: Install docs dependencies
+        run: npm ci
+        working-directory: docs
+      - name: Build with Astro
+        run: npm run build
+        working-directory: docs
       - name: Upload artifact
-        uses: actions/upload-pages-artifact@v4
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9  # v5
         with:
-          path: ./_site
+          path: ./docs/dist
 
   # Deployment job
   deploy:
+    name: 🚀 Deploy
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
@@ -52,4 +96,4 @@ jobs:
     steps:
       - name: Deploy to GitHub Pages
         id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128  # v5

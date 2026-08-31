@@ -1,4 +1,147 @@
+default_install_hook_types: [pre-commit, pre-push]
+
 repos:
+  - repo: local
+    hooks:
+      - id: rrt-branch-name
+        name: rrt branch name
+        entry: uv run rrt-hooks pre-commit
+        language: system
+        always_run: true
+        pass_filenames: false
+        stages: [pre-commit]
+
+      - id: rrt-no-raw-print
+        name: rrt no raw print
+        entry: python3 scripts/check_no_raw_prints.py
+        language: system
+        always_run: true
+        pass_filenames: false
+        stages: [pre-commit]
+
+      - id: rrt-ruff-check
+        name: rrt ruff check
+        entry: uv run ruff check --fix --output-format=full src tests
+        language: system
+        always_run: true
+        pass_filenames: false
+        stages: [pre-commit]
+
+      - id: rrt-ruff-format
+        name: rrt ruff format
+        entry: uv run ruff format --check src tests
+        language: system
+        always_run: true
+        pass_filenames: false
+        stages: [pre-commit]
+
+      - id: rrt-ty-check
+        name: rrt ty check
+        entry: uv run ty check src tests
+        language: system
+        always_run: true
+        pass_filenames: false
+        stages: [pre-commit]
+
+      - id: rrt-cli-docs
+        name: rrt cli docs
+        entry: uv run poe docs-verify
+        language: system
+        files: '^src/repo_release_tools/'
+        always_run: false
+        pass_filenames: false
+        stages: [pre-commit]
+
+      - id: rrt-docstring-check
+        name: rrt docstring check
+        # Run only the focused test and override pytest addopts to avoid the repo-wide coverage gate.
+        entry: uv run pytest -q -o addopts= tests/commands/test_commands_docstrings.py
+        language: system
+        files: '^src/repo_release_tools/commands/'
+        always_run: true
+        pass_filenames: false
+        stages: [pre-commit]
+
+      - id: rrt-ci-lint-gate
+        name: rrt ci lint gate
+        entry: uvx pre-commit run --all-files --show-diff-on-failure
+        language: system
+        always_run: true
+        pass_filenames: false
+        stages: [pre-push]
+
+      - id: rrt-tree-auto-update
+        name: rrt tree auto-update
+        entry: bash -c 'uv run rrt tree --check --strict || (uv run rrt tree --snapshot && git add .rrt/tree.lock.toml)'
+        language: system
+        always_run: true
+        pass_filenames: false
+        stages: [pre-commit]
+
+      - id: rrt-doctor-auto-update
+        name: rrt doctor auto-update
+        entry: bash -c 'uv run rrt doctor --check --strict || (uv run rrt doctor --snapshot && git add .rrt/health.lock.toml)'
+        language: system
+        always_run: true
+        pass_filenames: false
+        stages: [pre-commit]
+
+      - id: rrt-tree-check
+        name: rrt tree check (pre-push)
+        entry: bash -c 'if ! uv run rrt tree --check --strict; then uv run rrt tree --snapshot && git add .rrt/tree.lock.toml && echo "↺  Snapshot auto-updated — commit .rrt/tree.lock.toml and push again." && exit 1; fi'
+        language: system
+        always_run: true
+        pass_filenames: false
+        stages: [pre-push]
+
+      - id: rrt-folder-check
+        name: rrt folder check
+        entry: uv run rrt-hooks folder-check
+        language: system
+        always_run: true
+        pass_filenames: false
+        stages: [pre-commit, pre-push]
+
+      - id: rrt-artifacts-generate
+        name: rrt artifacts generate
+        entry: uv run rrt-hooks artifacts-generate
+        language: system
+        always_run: true
+        pass_filenames: false
+        stages: [pre-commit]
+
+      - id: rrt-artifacts-check
+        name: rrt artifacts check
+        entry: uv run rrt-hooks artifacts-check
+        language: system
+        always_run: true
+        pass_filenames: false
+        stages: [manual]
+
+      - id: rrt-config-reference-auto-update
+        name: rrt config reference auto-update
+        entry: bash -c 'uv run rrt config --reference --check || (uv run rrt config --reference && git add docs/rrt-config-reference.toml)'
+        language: system
+        always_run: true
+        pass_filenames: false
+        stages: [pre-commit]
+
+      - id: rrt-config-validate
+        name: rrt config validate
+        entry: uv run rrt-hooks config-validate
+        language: system
+        always_run: true
+        pass_filenames: false
+        stages: [pre-commit]
+
+      - id: rrt-release-check
+        name: rrt release check
+        entry: uv run rrt-hooks release-check
+        language: system
+        always_run: true
+        pass_filenames: false
+        stages: [manual]
+
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v6.0.0
     hooks:
@@ -9,13 +152,6 @@ repos:
       - id: debug-statements
       - id: check-toml
       - id: check-case-conflict
-
-  - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.15.9
-    hooks:
-      - id: ruff
-        args: [--fix]
-      - id: ruff-format
 
 
 ci:

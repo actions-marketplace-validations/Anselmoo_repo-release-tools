@@ -1,4 +1,4 @@
-name: Hybrid Runtime
+name: 🧬 Hybrid Runtime
 
 on:
   push:
@@ -28,37 +28,41 @@ concurrency:
 
 jobs:
   runtime:
-    name: Hybrid runtime examples
+    name: 🧬 Hybrid runtime examples
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
 
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7
         with:
           python-version: "3.12"
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@v7
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d  # v10.0.1
         with:
           enable-cache: true
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7
         with:
           node-version: "20"
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7
         with:
           go-version: "1.22"
 
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c  # stable
 
       - name: Sync dependencies
         run: uv sync --all-groups
 
       - name: Run hybrid runtime pytest suite
-        run: uv run pytest -q -m runtime tests/test_runtime_hybrid.py
+        # Explicitly override the coverage fail threshold for the hybrid runtime
+        # job because it runs a focused runtime-only test which doesn't exercise
+        # the full codebase. Pass a lower fail-under so the workflow doesn't
+        # fail due to the global `--cov-fail-under=100` in pyproject.toml.
+        run: uv run pytest -q -m runtime tests/integration/test_runtime_hybrid.py --cov-fail-under=0

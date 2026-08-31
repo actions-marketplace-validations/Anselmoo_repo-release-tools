@@ -1,0 +1,375 @@
+"""Install bundled rrt user agent definitions (.agent.md files).
+
+## Overview
+
+`rrt agents` manages installation of the packaged user-facing agent definitions
+into tool-specific agent directories. The only implemented subcommand is `install`.
+
+## Target surfaces
+
+The install command can write to local or global agent roots for:
+
+- Claude: `.claude/agents`
+- Codex: `.codex/agents`
+- Copilot: `.github/agents` (local), `~/.copilot/agents` (global)
+- Gemini: `.gemini/agents`
+
+Each target receives one flat `.agent.md` file per bundled user agent.
+
+## Behavior
+
+- Accepts one or more `--target` values; duplicates are ignored after first use.
+- Resolves local targets relative to the current working directory and global
+  targets relative to the home directory.
+- Refuses to overwrite an existing file unless `--force` is provided.
+- Supports `--dry-run` previews that show the resolved destination paths
+  without writing files.
+
+## Examples
+
+- `rrt agents install --target claude-local`
+- `rrt agents install --target claude-local --target codex-local`
+- `rrt agents install --target claude-global --force`
+- `rrt agents install --dry-run`
+
+## Caveats
+
+- `rrt agents` requires a subcommand; use `rrt agents install ...`.
+- Without `--target`, the command prints available destinations in dry-run
+  mode and otherwise fails.
+- Existing files at the destination are replaced only when `--force` is used.
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+
+from repo_release_tools.commands._cli_shared import add_dry_run_flag
+from repo_release_tools.commands._install_shared import (
+    display_path,
+    emit_install_error,
+    resolve_install_plan,
+)
+from repo_release_tools.commands._registry import CommandCategory, CommandGroup, register_command
+from repo_release_tools.integrations.agent_assets import BUNDLED_AGENTS, BundledAgent
+from repo_release_tools.ui import DryRunPrinter
+
+AGENT_TARGET_PATHS = {
+    "claude-global": lambda cwd, home: home / ".claude" / "agents",
+    "claude-local": lambda cwd, home: cwd / ".claude" / "agents",
+    "codex-global": lambda cwd, home: home / ".codex" / "agents",
+    "codex-local": lambda cwd, home: cwd / ".codex" / "agents",
+    "copilot-global": lambda cwd, home: home / ".copilot" / "agents",
+    "copilot-local": lambda cwd, home: cwd / ".github" / "agents",
+    "gemini-global": lambda cwd, home: home / ".gemini" / "agents",
+    "gemini-local": lambda cwd, home: cwd / ".gemini" / "agents",
+}
+
+AGENTS_EXAMPLES = (
+    "  $ rrt agents install --target claude-local\n"
+    "  $ rrt agents install --target claude-local --target codex-local\n"
+    "  $ rrt agents install --target copilot-local\n"
+    "  $ rrt agents install --target claude-global --force"
+)
+
+AGENTS_INSTALL_EXAMPLES = (
+    "  $ rrt agents install --target claude-local\n"
+    "  $ rrt agents install --target claude-local --target codex-local\n"
+    "  $ rrt agents install --target gemini-local\n"
+    "  $ rrt agents install --target claude-global --force --dry-run\n"
+    "  $ rrt agents install --target copilot-global"
+)
+
+
+def _select_install_agents(
+    agents: list[str] | None,
+) -> tuple[list[BundledAgent] | None, str | None]:
+    """Resolve the ``--agent``/``--agents`` filter into a concrete agent list.
+
+    Returns ``(selected_agents, error_message)``. When *agents* is falsy, no
+    filtering is requested and ``(None, None)`` is returned so the caller
+    keeps its full-catalog default. When a requested name is unknown,
+    ``(None, error_message)`` is returned. A matched agent with a ``family``
+    expands to every agent sharing that family; the result preserves
+    :data:`BUNDLED_AGENTS` canonical order and drops duplicates.
+    """
+    if not agents:
+        return None, None
+    requested_set: set[str] = set()
+    interim: list[BundledAgent] = []
+    for name in agents:
+        match = next((a for a in BUNDLED_AGENTS if a.name == name), None)
+        if match is None:
+            return (
+                None,
+                f"Unknown agent: {name}. Available: {', '.join(a.name for a in BUNDLED_AGENTS)}",
+            )
+        if match.family:
+            interim.extend([a for a in BUNDLED_AGENTS if a.family == match.family])
+        else:
+            interim.append(match)
+    ordered: list[BundledAgent] = []
+    for a in BUNDLED_AGENTS:
+        if a in interim and a.name not in requested_set:
+            ordered.append(a)
+            requested_set.add(a.name)
+    return ordered, None
+
+
+def _find_install_conflicts(
+    install_plan: list[tuple[str, Path]],
+    selected_agents: list[BundledAgent],
+    *,
+    force: bool,
+) -> list[tuple[str, str, Path]]:
+    """Return every (target, agent, destination) that already exists and isn't forced."""
+    if force:
+        return []
+    conflicts: list[tuple[str, str, Path]] = []
+    for target_name, agents_dir in install_plan:
+        for agent in selected_agents:
+            destination = agents_dir / f"{agent.name}.agent.md"
+            if destination.exists():
+                conflicts.append((target_name, agent.name, destination))
+    return conflicts
+
+
+def _show_available_install_targets(*, cwd: Path, home: Path) -> None:
+    p = DryRunPrinter(True)
+    p.blank_line()
+    p.header("Agent install", Agents=str(len(BUNDLED_AGENTS)))
+    p.section("Available targets")
+    for target_name, resolver in sorted(AGENT_TARGET_PATHS.items()):
+        for agent in BUNDLED_AGENTS:
+            location = display_path(
+                resolver(cwd, home) / f"{agent.name}.agent.md",
+                cwd=cwd,
+                home=home,
+            )
+            p.would_install(agent.name, target_name, location)
+    p.blank_line()
+    p.footer("pass --target DEST to install (see targets above)")
+
+
+@dataclass(frozen=True)
+class InstallOptions:
+    """Typed view of ``argparse.Namespace`` for ``rrt agents install``.
+
+    Built once via :meth:`from_args` at the top of :func:`cmd_install` so all
+    flags it reads have typed read sites instead of ``getattr(args, ...,
+    default)`` / ``args.x`` calls throughout the function body.
+    """
+
+    targets: list[str] | None
+    agents: list[str] | None
+    dry_run: bool
+    force: bool
+    verbose: int
+
+    @classmethod
+    def from_args(cls, args: argparse.Namespace) -> InstallOptions:
+        """Build an :class:`InstallOptions` from a parsed ``argparse.Namespace``.
+
+        ``targets``, ``dry_run``, and ``force`` are given real defaults by
+        agents_cmd.py's own register(), and every test in
+        tests/commands/test_agents_cmd.py that exercises cmd_install
+        constructs its Namespace with all three set explicitly, so they are
+        read directly. ``agents`` is also given a real default (None) by
+        register(), but many tests in tests/commands/test_agents_cmd.py
+        (e.g. test_cmd_install_writes_local_agents,
+        test_cmd_install_no_targets_dry_run_shows_available) build a
+        Namespace that omits ``agents`` entirely, so the getattr fallback
+        here absorbs that gap. ``verbose`` is set globally by cli.py's
+        parser, but no test Namespace here ever sets it, so the getattr
+        fallback here absorbs that gap too.
+        """
+        return cls(
+            targets=args.targets,
+            agents=getattr(args, "agents", None),
+            dry_run=args.dry_run,
+            force=args.force,
+            verbose=getattr(args, "verbose", 0) or 0,
+        )
+
+
+def cmd_install(args: argparse.Namespace) -> int:
+    """Install bundled user agents into one or more agent directories.
+
+    Supports optional --agent/--agents to request installation of a single
+    agent by name. When the requested agent declares a `family:` metadata key,
+    the entire family is installed instead.
+    """
+    opts = InstallOptions.from_args(args)
+    verbose = opts.verbose
+    cwd = Path.cwd()
+    home = Path.home()
+    if not opts.targets:
+        if opts.dry_run:
+            _show_available_install_targets(cwd=cwd, home=home)
+            return 0
+        available = ", ".join(sorted(AGENT_TARGET_PATHS))
+        return emit_install_error(
+            f"No --target specified. Pass --target DEST (e.g. --target claude-local). Available: {available}.",
+        )
+
+    install_plan = resolve_install_plan(opts.targets, AGENT_TARGET_PATHS, cwd=cwd, home=home)
+
+    # Determine selected agents based on optional --agent flags.
+    selected_agents, agent_error = _select_install_agents(opts.agents)
+    if agent_error is not None:
+        return emit_install_error(agent_error)
+    if selected_agents is None:
+        selected_agents = list(BUNDLED_AGENTS)
+
+    p = DryRunPrinter(opts.dry_run, verbose=verbose)
+    p.blank_line()
+    p.header(
+        "Agent install",
+        Agents=str(len(selected_agents)),
+        Targets=str(len(install_plan)),
+    )
+
+    conflicts = _find_install_conflicts(install_plan, selected_agents, force=opts.force)
+
+    if conflicts:
+        for target_name, agent_name, destination in conflicts:
+            location = display_path(destination, cwd=cwd, home=home)
+            return emit_install_error(
+                f"{target_name} already has {agent_name} at {location}. Use --force to overwrite it.",
+            )
+
+    if opts.dry_run:
+        for target_name, agents_dir in install_plan:
+            for agent in selected_agents:
+                destination = agents_dir / f"{agent.name}.agent.md"
+                location = display_path(destination, cwd=cwd, home=home)
+                p.would_install(agent.name, target_name, location)
+        p.blank_line()
+        p.footer("no files were modified")
+        return 0
+
+    for target_name, agents_dir in install_plan:
+        agents_dir.mkdir(parents=True, exist_ok=True)
+        for agent in selected_agents:
+            destination = agents_dir / f"{agent.name}.agent.md"
+            try:
+                destination.write_text(agent.markdown.rstrip() + "\n", encoding="utf-8")
+            except OSError as exc:
+                location = display_path(destination, cwd=cwd, home=home)
+                return emit_install_error(
+                    f"Could not install {agent.name} to {target_name} ({location}): {exc}",
+                )
+            location = display_path(destination, cwd=cwd, home=home)
+            p.ok(f"Installed {agent.name} to {target_name}: {location}")
+    return 0
+
+
+@register_command(name="agents", category=CommandCategory.WRITE, group=CommandGroup.SETUP_TOOLING)
+def register(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    """Register the agents command group."""
+    parser = subparsers.add_parser(
+        "agents",
+        help="Install bundled rrt user agents into agent directories.",
+        description="Install bundled rrt user agents into one or more local or global agent directories.",
+        epilog=AGENTS_EXAMPLES,
+    )
+    agents_sub = parser.add_subparsers(
+        dest="agents_command",
+        metavar="<agents_command>",
+        parser_class=type(parser),
+        required=True,
+    )
+
+    install_parser = agents_sub.add_parser(
+        "install",
+        help="Install bundled rrt user agents into agent directories.",
+        description="Install bundled .agent.md user agents into one or more local or global agent directories.",
+        epilog=AGENTS_INSTALL_EXAMPLES,
+    )
+    install_parser.add_argument(
+        "--target",
+        dest="targets",
+        action="append",
+        required=False,
+        choices=sorted(AGENT_TARGET_PATHS),
+        metavar="DEST",
+        help=(
+            "Install target. Repeat to install into multiple locations: "
+            "claude-local, claude-global, codex-local, codex-global, "
+            "copilot-local, copilot-global, gemini-local, gemini-global."
+        ),
+    )
+    install_parser.add_argument(
+        "--agent",
+        dest="agents",
+        action="append",
+        required=False,
+        metavar="AGENT",
+        help=(
+            "Install a specific agent by name. When the agent declares a `family:` metadata, "
+            "the entire family will be installed. Repeat for multiple agents."
+        ),
+    )
+    add_dry_run_flag(install_parser)
+    install_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Overwrite existing agent files.",
+    )
+    install_parser.set_defaults(handler=cmd_install)
+
+
+def main() -> None:
+    """Entry point for the rrt-agents standalone CLI."""
+    parser = argparse.ArgumentParser(
+        prog="rrt-agents",
+        description="Install bundled rrt user agents into agent directories.",
+        epilog=AGENTS_EXAMPLES,
+    )
+    sub = parser.add_subparsers(
+        dest="agents_command",
+        metavar="<command>",
+        required=True,
+    )
+    install_parser = sub.add_parser(
+        "install",
+        help="Install bundled rrt user agents into agent directories.",
+        description="Install bundled .agent.md user agents into one or more local or global agent directories.",
+        epilog=AGENTS_INSTALL_EXAMPLES,
+    )
+    install_parser.add_argument(
+        "--target",
+        dest="targets",
+        action="append",
+        required=False,
+        choices=sorted(AGENT_TARGET_PATHS),
+        metavar="DEST",
+        help=(
+            "Install target. Repeat to install into multiple locations: "
+            "claude-local, claude-global, codex-local, codex-global, "
+            "copilot-local, copilot-global, gemini-local, gemini-global."
+        ),
+    )
+    install_parser.add_argument(
+        "--agent",
+        dest="agents",
+        action="append",
+        required=False,
+        metavar="AGENT",
+        help=(
+            "Install a specific agent by name. When the agent declares a `family:` metadata, "
+            "the entire family will be installed. Repeat for multiple agents."
+        ),
+    )
+    add_dry_run_flag(install_parser)
+    install_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Overwrite existing agent files.",
+    )
+    install_parser.set_defaults(handler=cmd_install)
+    args = parser.parse_args()
+    sys.exit(args.handler(args))

@@ -1,0 +1,403 @@
+"""Validate release-oriented rrt configuration targets for the current repository.
+
+## Overview
+
+`rrt release check` is the feature-specific health gate for release automation.
+It focuses on the config targets that drive version bumps and changelog updates,
+without mixing in broader repository automation checks.
+
+## What it checks
+
+For each resolved version group, the command checks:
+
+- version target files exist
+- version target values can be read
+- pin target patterns compile as regular expressions
+- pin target files contain at least one match
+- pin target captured versions match the group's canonical version
+- the group changelog file exists
+
+It also checks any global pin targets, deduplicating repeated path/pattern
+pairs so the same target is not reported twice.
+
+## Output and severity
+
+The command prints one grouped report per version group and an overall status at
+the end.
+
+- missing targets and missing changelog files are errors
+- unreadable version content is reported as a warning
+- pin patterns that compile but do not match are reported as a warning
+- pin patterns that match but capture a stale version (drift from the
+  group's canonical version) are reported as a warning
+- valid matches and readable targets are reported as OK
+
+## Config discovery behavior
+
+If no config file can be found in the current directory or any ancestor, the
+command prints repository guidance and exits with an error. The supported
+config roots are `pyproject.toml`, `package.json`, `Cargo.toml`, `.rrt.toml`,
+and `.config/rrt.toml`.
+
+If a config is auto-detected, the command emits a notice on stderr before the
+main report so you can tell that rrt did not use an explicitly selected file.
+
+## Examples
+
+```bash
+rrt release check
+```
+
+The command can be run from a nested subdirectory inside the repository; rrt
+walks upward until it finds the repo root and then checks the resolved config
+from there.
+
+Version targets may also point at Go, Rust, or .NET-style version files when
+you need to keep multiple language surfaces aligned.
+
+## Related docs
+
+- [rrt doctor](/repo-release-tools/commands/doctor/)
+- [rrt eol (CLI)](/repo-release-tools/commands/rrt-cli/)
+- [pre-commit / lefthook](/repo-release-tools/commands/hooks/)
+- [GitHub Action](/repo-release-tools/action/)
+"""
+
+from __future__ import annotations
+
+import argparse
+import re
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+
+from repo_release_tools.commands._common import describe_config_load_error
+from repo_release_tools.commands._registry import CommandCategory, CommandGroup, register_command
+from repo_release_tools.commands.release_notes import register_subcommand as _register_notes
+from repo_release_tools.commands.release_repair import register_subcommand as _register_repair
+from repo_release_tools.config import (
+    PinTarget,
+    RrtConfig,
+    VersionGroup,
+    VersionTarget,
+    _describe_version_target,
+    find_repo_root,
+    format_autodetected_config_notice,
+    iter_config_files,
+    load_or_autodetect_config,
+)
+from repo_release_tools.ui import VerbosePrinter
+from repo_release_tools.version.targets import read_version_string
+
+RELEASE_CHECK_EPILOG = "  $ rrt release check"
+
+_RELEASE_CHECK_EXTENDED_DOC = (
+    (__doc__ or "")
+    + """
+## `rrt doctor` vs `rrt release check`
+
+| Check | `rrt doctor` | `rrt release check` |
+|---|---|---|
+| Hook manager integration | Yes | No |
+| CI workflow surfaces | Yes | No |
+| Version target reachability | No | Yes |
+| Pin target regex matches | No | Yes |
+| Changelog file existence | No | Yes |
+
+**Rule of thumb:** run `rrt doctor` to confirm automation wiring is in
+place; run `rrt release check` before cutting a release to confirm that
+the files `rrt bump` will touch are reachable.
+
+## Common failures
+
+```
+Error: version target 'src/myapp/__init__.py' not found
+```
+→ The file was moved or renamed. Update `path` in `pyproject.toml`.
+
+```
+Error: pin target pattern has no matches in 'docs/conf.py'
+```
+→ The pattern compiles but matches nothing. Check the regex, or set
+`pin_target_missing = "warn"` to downgrade to a warning during migration.
+
+```
+Warning: docs/README.md drift: pin has '0.15.17', expected '0.15.18'
+```
+→ The pin pattern matched, but the captured version is stale — the file
+was not updated on the last release. Run `rrt bump` to refresh pin targets,
+or check for a release step that skipped this file.
+
+```
+Error: changelog file 'CHANGELOG.md' not found
+```
+→ First-release setup: the changelog file doesn't exist yet. Create it
+with `[Unreleased]` as a placeholder section.
+
+## Hook usage
+
+```bash
+rrt release check
+
+# Or via pre-commit (manual stage):
+pre-commit run rrt-release-check --hook-stage manual
+```
+"""
+)
+
+SOURCE_OWNED_TOPIC_DOCS: tuple[tuple[str, str], ...] = (("release", _RELEASE_CHECK_EXTENDED_DOC),)
+
+
+def _check_version_target(target: VersionTarget, root: Path) -> tuple[str, bool, str]:
+    """Return the status message, whether it is okay, and its severity."""
+    relative = str(target.path.relative_to(root))
+    kind_hint = _describe_version_target(target, root=root).split("(", 1)
+    suffix = f" ({kind_hint[1]}" if len(kind_hint) > 1 else ""
+
+    if not target.path.exists():
+        return f"{relative}{suffix} not found", False, "error"
+
+    try:
+        version = read_version_string(target)
+        return f"{relative}{suffix} {version}", True, "ok"
+    except (RuntimeError, ValueError):
+        return f"{relative}{suffix} version unreadable", True, "warning"
+
+
+def _check_pin_target(
+    pin: PinTarget,
+    root: Path,
+    expected_version: str | None,
+) -> tuple[str, bool, str]:
+    """Return the status message, whether it is okay, and its severity.
+
+    *expected_version* is the group's canonical current version (``None``
+    when it could not be read). When the pin's captured version group
+    differs from it, this is reported as a non-blocking "drift" warning —
+    the pattern still matched, but the file is stale.
+    """
+    relative = str(pin.path.relative_to(root))
+
+    if not pin.path.exists():
+        return f"{relative} not found", False, "error"
+
+    try:
+        compiled = re.compile(pin.pattern)
+    except re.error as exc:
+        return f"{relative} bad pattern: {exc}", False, "error"
+
+    text = pin.path.read_text(encoding="utf-8")
+    match = compiled.search(text)
+    if match is None:
+        return f"{relative} no match", True, "warning"
+
+    if expected_version is not None:
+        current = match.group(2)
+        if current != expected_version:
+            return (
+                f"{relative} drift: pin has {current!r}, expected {expected_version!r}",
+                True,
+                "warning",
+            )
+
+    return f"{relative} match", True, "ok"
+
+
+def _resolve_expected_version(group: VersionGroup) -> tuple[str | None, str | None]:
+    """Return ``(expected_version, warning)`` for a group's pin-drift check.
+
+    *expected_version* is the group's canonical current version, or ``None``
+    when it could not be determined. *warning* is set only when
+    ``group.primary_target()`` itself raised ``ValueError`` (a
+    ``version_source`` misconfiguration) -- a real config bug that would
+    otherwise be silently swallowed, unlike an unreadable/missing version
+    file, which is already surfaced separately via the per-target checks in
+    :func:`_check_release_group`.
+    """
+    try:
+        primary = group.primary_target()
+    except ValueError as exc:
+        return None, f"pin drift check skipped: {exc}"
+
+    if not primary.path.exists():
+        return None, None
+
+    try:
+        return read_version_string(primary), None
+    except (RuntimeError, ValueError):
+        return None, None
+
+
+@dataclass(frozen=True)
+class ReleaseCheckOptions:
+    """Typed view of ``argparse.Namespace`` for ``rrt release check``.
+
+    Built once via :meth:`from_args` at the top of :func:`cmd_release_check`
+    so the single flag it reads has a typed read site instead of a bare
+    ``getattr(args, ..., default)`` call.
+    """
+
+    verbose: int
+
+    @classmethod
+    def from_args(cls, args: argparse.Namespace) -> ReleaseCheckOptions:
+        """Build a :class:`ReleaseCheckOptions` from a parsed ``argparse.Namespace``.
+
+        ``verbose`` is set globally by cli.py's parser, so a Namespace produced
+        by argparse always carries it. The getattr fallback exists only because
+        several tests in tests/commands/test_release_cmd.py call
+        cmd_release_check with a bare ``argparse.Namespace()`` that never sets
+        ``verbose``.
+        """
+        return cls(verbose=getattr(args, "verbose", 0) or 0)
+
+
+def _check_release_group(
+    group: VersionGroup,
+    config: RrtConfig,
+    root: Path,
+    p: VerbosePrinter,
+) -> bool:
+    """Check one version group's targets, render its report, and return overall status.
+
+    Aggregates version-target, pin-target, and changelog-file checks for
+    *group* into a single `[group.name]` report block, matching the original
+    inline loop body of :func:`cmd_release_check`. Returns ``True`` when every
+    check in the group passed.
+    """
+    group_ok = True
+    statuses: list[tuple[str, str]] = []
+
+    for target in group.version_targets:
+        message, ok, severity = _check_version_target(target, root)
+        statuses.append((message, severity))
+        if not ok:
+            group_ok = False
+
+    all_pins = group.pin_targets + config.global_pin_targets
+    if all_pins:
+        expected_version, warning = _resolve_expected_version(group)
+        if warning is not None:
+            statuses.append((warning, "warning"))
+
+        seen: set[tuple[object, str]] = set()
+        unique_pins = []
+        for pin in all_pins:
+            key = (pin.path, pin.pattern)
+            if key not in seen:
+                seen.add(key)
+                unique_pins.append(pin)
+
+        for pin in unique_pins:
+            message, ok, severity = _check_pin_target(pin, root, expected_version)
+            statuses.append((message, severity))
+            if not ok:
+                group_ok = False
+
+    changelog = group.changelog_file
+    if changelog.exists():
+        statuses.append((f"{changelog.relative_to(root)} exists", "ok"))
+    else:
+        statuses.append((f"{changelog.relative_to(root)} not found", "error"))
+        group_ok = False
+
+    if group_ok:
+        p.ok(f"[{group.name}]")
+    else:
+        p.line(f"[{group.name}]", ok=False)
+    for msg, severity in statuses:
+        match severity:
+            case "ok":
+                p.line(f"  {msg}", ok=True)
+            case "obsolete":
+                p.obsolete(f"  {msg}")
+            case "warning":
+                p.warn(f"  {msg}")
+            case _:
+                p.line(f"  {msg}", ok=False)
+    p.blank_line()
+
+    return group_ok
+
+
+def cmd_release_check(args: argparse.Namespace) -> int:
+    """Check release-oriented version, pin, and changelog targets."""
+    opts = ReleaseCheckOptions.from_args(args)
+    verbose = opts.verbose
+    root = find_repo_root(Path.cwd())
+
+    try:
+        config = load_or_autodetect_config(root)
+    except FileNotFoundError as exc:
+        err = describe_config_load_error(exc, root, no_config_file_checked=iter_config_files(root))
+        VerbosePrinter(verbose=verbose).line(err.text, ok=False, stream=sys.stderr)
+        return 1
+    except (ValueError, RuntimeError) as exc:
+        err = describe_config_load_error(exc, root)
+        p = VerbosePrinter(verbose=verbose)
+        if err.kind == "missing_tool_rrt":
+            p.warn("No [tool.rrt] configuration found.", stream=sys.stderr)
+            p.action(err.text, stream=sys.stderr)
+        else:
+            p.line(err.text, ok=False, stream=sys.stderr)
+        return 1
+
+    p = VerbosePrinter(verbose=verbose)
+    if config.autodetected:
+        p.warn(format_autodetected_config_notice(config), stream=sys.stderr)
+
+    source = "(auto-detected)" if config.autodetected else str(config.config_file.relative_to(root))
+    group_count = len(config.version_groups)
+    plural = "group" if group_count == 1 else "groups"
+    p.ok("rrt release check")
+    p.action(f"Config file: {source}")
+    p.action(f"Version groups: {group_count} {plural}")
+    p.blank_line()
+
+    all_ok = True
+    p.section("Release checks")
+
+    for group in config.version_groups:
+        if not _check_release_group(group, config, root, p):
+            all_ok = False
+
+    if all_ok:
+        p.ok("All release checks passed.")
+        return 0
+
+    p.line("One or more release checks failed.", ok=False)
+    return 1
+
+
+@register_command(name="release", category=CommandCategory.READ, group=CommandGroup.VERSION_RELEASE)
+def register(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    """Register release-oriented commands."""
+    parser = subparsers.add_parser(
+        "release",
+        help="Release-oriented checks and workflows.",
+        description=(
+            "Release-specific workflows and checks.\n\n"
+            "Use `rrt release check` to validate version targets, pin targets, and "
+            "changelog files without mixing in broader repository automation checks."
+        ),
+    )
+    release_subparsers = parser.add_subparsers(
+        dest="release_command",
+        metavar="<release_command>",
+        required=True,
+    )
+
+    check_parser = release_subparsers.add_parser(
+        "check",
+        help="Validate version targets, pin targets, and changelog files.",
+        description=(
+            "Validate the release-oriented parts of the resolved rrt configuration for the "
+            "current repository, starting from the nearest repo root above the current "
+            "working directory."
+        ),
+        epilog=RELEASE_CHECK_EPILOG,
+    )
+    check_parser.set_defaults(handler=cmd_release_check)
+
+    _register_notes(release_subparsers)
+    _register_repair(release_subparsers)

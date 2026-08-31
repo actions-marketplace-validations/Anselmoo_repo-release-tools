@@ -1,4 +1,4 @@
-name: CI/CD
+name: 🚀 CI/CD
 
 on:
   push:
@@ -33,19 +33,19 @@ env:
 
 jobs:
   lint:
-    name: Lint
+    name: 🔍 Lint
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
 
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@v7
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d  # v10.0.1
         with:
           enable-cache: true
 
@@ -55,9 +55,51 @@ jobs:
       - name: Ruff lint
         run: uvx pre-commit run --all-files --show-diff-on-failure
 
+      - name: Install mcp-publisher
+        run: |
+          MCP_PUBLISHER_VERSION="v1.8.1"
+          curl -fsSL "https://github.com/modelcontextprotocol/registry/releases/download/${MCP_PUBLISHER_VERSION}/mcp-publisher_$(uname -s | tr '[:upper:]' '[:lower:]')_$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/').tar.gz" | tar xz mcp-publisher
+          chmod +x mcp-publisher
+
+      - name: Validate server.json
+        run: ./mcp-publisher validate
+
+  verify:
+    name: ✅ Snapshot drift checks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+      - name: Set up uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d  # v10.0.1
+        with:
+          enable-cache: true
+      - name: Install dependencies
+        run: uv sync --all-groups
+      - name: Check docs lock drift
+        run: uv run rrt docs publish --check
+      - name: Check docs inject drift
+        run: uv run rrt docs inject --check
+      - name: Check health regressions
+        run: uv run rrt doctor --check --strict
+      - name: Generate tree manifest (for diagnostics)
+        run: uv run rrt tree --manifest --compress
+      - name: Upload tree manifest artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
+        with:
+          name: tree-manifest
+          path: .rrt/tree.manifest.json.gz
+          retention-days: 7
+      - name: Check tree structure drift
+        run: uv run rrt tree --check --strict --strict-empty-dirs
+      - name: Generate badge SVGs for artifact check
+        run: uv run python -m repo_release_tools.assets.badges src/repo_release_tools/assets/badges
+      - name: Check artifact integrity
+        run: uv run rrt artifacts --check --strict
+
   test:
-    name: Tests (${{ matrix.python-version }})
-    needs: lint
+    name: 🧪 Tests (${{ matrix.python-version }})
+    needs: [lint, verify]
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -65,15 +107,15 @@ jobs:
         python-version: ["3.12", "3.13", "3.14"]
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
 
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7
         with:
           python-version: ${{ matrix.python-version }}
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@v7
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d  # v10.0.1
         with:
           enable-cache: true
 
@@ -81,22 +123,40 @@ jobs:
         run: uv sync --all-groups
 
       - name: Run tests
-        run: uv run pytest -q -m "not runtime"
+        run: uv run pytest -q -m "not runtime and not e2e"
+        env:
+          PYTHON: ${{ matrix.python-version }}
+
+      - name: Run e2e behavior-contract tests
+        run: uv run pytest -q -m e2e --no-cov
+        env:
+          PYTHON: ${{ matrix.python-version }}
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f  # v7
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: ./coverage.xml
+          flags: python-${{ matrix.python-version }}
+          env_vars: PYTHON
+          name: repo-release-tools-${{ matrix.python-version }}
+          fail_ci_if_error: true
+          verbose: false
 
   docker-image-check:
-    name: Docker image smoke check
+    name: 🐳 Docker image smoke check
     needs: test
     if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c  # v4
 
       - name: Build Docker image
-        uses: docker/build-push-action@v7
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a  # v7
         with:
           context: .
           file: ./Dockerfile
@@ -108,7 +168,7 @@ jobs:
         run: docker run --rm repo-release-tools:ci --help
 
   docker-publish:
-    name: Publish Docker image
+    name: 🐳 Publish Docker image
     needs: docker-image-check
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
@@ -117,13 +177,13 @@ jobs:
       packages: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c  # v4
 
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v4
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f  # v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -131,7 +191,7 @@ jobs:
 
       - name: Extract Docker metadata
         id: meta
-        uses: docker/metadata-action@v6
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302  # v6
         with:
           images: ghcr.io/${{ github.repository }}
           tags: |
@@ -140,7 +200,7 @@ jobs:
             type=raw,value=latest
 
       - name: Build and push Docker image
-        uses: docker/build-push-action@v7
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a  # v7
         with:
           context: .
           file: ./Dockerfile
@@ -150,21 +210,21 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
 
   build:
-    name: Build package
+    name: 📦 Build package
     needs: test
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
 
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@v7
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d  # v10.0.1
         with:
           enable-cache: true
 
@@ -175,13 +235,41 @@ jobs:
         run: uvx twine check dist/*
 
       - name: Upload distribution artifacts
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
         with:
           name: python-package-distributions
           path: dist/
 
+  build-mcpb:
+    name: 📦 Build .mcpb bundle
+    needs: [build]
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+      - name: Download wheel
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8
+        with:
+          name: python-package-distributions
+          path: dist/
+      - name: Build .mcpb bundle
+        uses: Anselmoo/mcp2mcpb@162b8c56d000073f7765381f6259d57fd3cfbc28
+        with:
+          package: repo-release-tools
+          registry: pypi
+          mode: reference
+          from-dist: dist/
+          attach-to-release: 'false'
+      - name: Upload .mcpb artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
+        with:
+          name: mcpb-package
+          path: dist/*.mcpb
+          if-no-files-found: error
+
   sbom:
-    name: Generate SBOM
+    name: 📜 Generate SBOM
     needs: build
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
@@ -189,23 +277,23 @@ jobs:
       contents: read
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
 
       - name: Generate SBOM
-        uses: anchore/sbom-action@v0
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610  # v0
         with:
           format: spdx-json
           output-file: sbom.spdx.json
           path: .
 
       - name: Upload SBOM artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
         with:
           name: sbom
           path: sbom.spdx.json
 
   attest:
-    name: Attest build provenance
+    name: 🛡️ Attest build provenance
     needs: build
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
@@ -215,18 +303,18 @@ jobs:
       attestations: write
     steps:
       - name: Download distribution artifacts
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8
         with:
           name: python-package-distributions
           path: dist/
 
       - name: Generate provenance attestation
-        uses: actions/attest-build-provenance@v4
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4
         with:
           subject-path: dist/*
 
   publish-testpypi:
-    name: Publish to TestPyPI
+    name: 🧪 Publish to TestPyPI
     needs: [build, sbom, attest]
     if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
     runs-on: ubuntu-latest
@@ -237,25 +325,25 @@ jobs:
       url: https://test.pypi.org/p/repo-release-tools
     steps:
       - name: Download distribution artifacts
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8
         with:
           name: python-package-distributions
           path: dist/
 
       - name: Publish to TestPyPI
-        uses: pypa/gh-action-pypi-publish@release/v1
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33  # release/v1 (v1.14.2)
         with:
           repository-url: https://test.pypi.org/legacy/
           skip-existing: true
 
   verify-testpypi:
-    name: Verify TestPyPI package
+    name: 🧪 Verify TestPyPI package
     needs: publish-testpypi
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
@@ -286,7 +374,7 @@ jobs:
         run: rrt --help
 
   publish-pypi:
-    name: Publish to PyPI
+    name: 🚀 Publish to PyPI
     needs: [build, sbom, attest, publish-testpypi, verify-testpypi]
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
@@ -297,36 +385,79 @@ jobs:
       url: https://pypi.org/p/repo-release-tools
     steps:
       - name: Download distribution artifacts
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8
         with:
           name: python-package-distributions
           path: dist/
 
       - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@release/v1
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33  # release/v1 (v1.14.2)
+
+  publish-mcp-registry:
+    name: 📋 Publish to MCP Registry
+    needs: [publish-pypi, docker-publish]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+
+      - name: Install mcp-publisher
+        run: |
+          MCP_PUBLISHER_VERSION="v1.8.1"
+          curl -fsSL "https://github.com/modelcontextprotocol/registry/releases/download/${MCP_PUBLISHER_VERSION}/mcp-publisher_$(uname -s | tr '[:upper:]' '[:lower:]')_$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/').tar.gz" | tar xz mcp-publisher
+          chmod +x mcp-publisher
+
+      - name: Sync server.json version with release tag
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/v}
+          jq --arg v "$VERSION" '
+            .version = $v
+            | .packages |= map(
+                if .registryType == "pypi" then .version = $v
+                elif .registryType == "oci" then .identifier |= sub(":[^:]+$"; ":" + $v)
+                else . end)
+          ' server.json > server.tmp.json && mv server.tmp.json server.json
+
+      - name: Validate server.json
+        run: ./mcp-publisher validate
+
+      - name: Authenticate to MCP Registry
+        run: ./mcp-publisher login github-oidc
+
+      - name: Publish to MCP Registry
+        run: ./mcp-publisher publish
 
   github-release:
-    name: Create GitHub release
-    needs: [publish-pypi, sbom, docker-publish]
+    name: 🎁 Create GitHub release
+    needs: [publish-pypi, sbom, docker-publish, build-mcpb]
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
       - name: Download distribution artifacts
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8
         with:
           name: python-package-distributions
           path: dist/
 
       - name: Download SBOM artifact
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8
         with:
           name: sbom
           path: .
 
+      - name: Download .mcpb artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8
+        with:
+          name: mcpb-package
+          path: dist/
+
       - name: Create GitHub release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228  # v3
         with:
           generate_release_notes: true
           files: |

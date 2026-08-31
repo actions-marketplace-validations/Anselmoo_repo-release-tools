@@ -1,0 +1,265 @@
+"""Install bundled rrt user workflow skills.
+
+## Overview
+
+`rrt skill` manages installation of the packaged user-facing `rrt` skills into
+tool-specific skill directories. The only implemented subcommand is `install`.
+
+This repository bundles ten user workflow skills:
+- `rrt-user-bootstrap`
+- `rrt-user-versioning`
+- `rrt-user-release-flow`
+- `rrt-user-branch-strategy`
+- `rrt-user-commit-quality`
+- `rrt-user-changelog-automation`
+- `rrt-user-docs-consistency`
+- `rrt-user-config-safety`
+- `rrt-user-ci-readiness`
+- `rrt-user-migration-uvx-to-installed`
+
+## Target surfaces
+
+The install command can write to local or global skill roots for:
+
+- Claude: `.claude/skills`
+- Codex: `.codex/skills`
+- Copilot: `.github/skills` (local), `~/.copilot/skills` (global)
+- Gemini: `.gemini/skills`
+
+Each target receives one directory per bundled skill, each containing a
+`SKILL.md`.
+
+## Behavior
+
+- Accepts one or more `--target` values; duplicates are ignored after first use.
+- Resolves local targets relative to the current working directory and global
+  targets relative to the home directory.
+- Refuses to overwrite an existing skill directory unless `--force` is provided.
+- Supports `--dry-run` previews that show the resolved destination paths
+  without writing files.
+
+## Examples
+
+- `rrt skill install --target copilot-local`
+- `rrt skill install --target claude-local --target codex-local`
+- `rrt skill install --target gemini-local`
+- `rrt skill install --target copilot-global --force --dry-run`
+
+## Caveats
+
+- `rrt skill` requires a subcommand; use `rrt skill install ...`.
+- Without `--target`, the command prints available destinations in dry-run
+  mode and otherwise fails.
+- Existing symlinks, files, or directories at the destination are replaced
+  only when `--force` is used.
+"""
+
+from __future__ import annotations
+
+import argparse
+import shutil
+from dataclasses import dataclass
+from pathlib import Path
+
+from repo_release_tools.commands._cli_shared import add_dry_run_flag
+from repo_release_tools.commands._install_shared import (
+    display_path,
+    emit_install_error,
+    resolve_install_plan,
+)
+from repo_release_tools.commands._registry import CommandCategory, CommandGroup, register_command
+from repo_release_tools.integrations.skill_assets import BUNDLED_SKILLS
+from repo_release_tools.ui import DryRunPrinter
+
+TARGET_PATHS = {
+    "claude-global": lambda cwd, home: home / ".claude" / "skills",
+    "claude-local": lambda cwd, home: cwd / ".claude" / "skills",
+    "codex-global": lambda cwd, home: home / ".codex" / "skills",
+    "codex-local": lambda cwd, home: cwd / ".codex" / "skills",
+    "copilot-global": lambda cwd, home: home / ".copilot" / "skills",
+    "copilot-local": lambda cwd, home: cwd / ".github" / "skills",
+    "gemini-global": lambda cwd, home: home / ".gemini" / "skills",
+    "gemini-local": lambda cwd, home: cwd / ".gemini" / "skills",
+}
+
+
+SKILL_EXAMPLES = (
+    "  $ rrt skill install --target copilot-local\n"
+    "  $ rrt skill install --target claude-local --target codex-local\n"
+    "  $ rrt skill install --target gemini-local"
+)
+
+SKILL_INSTALL_EXAMPLES = (
+    "  $ rrt skill install --target copilot-local\n"
+    "  $ rrt skill install --target claude-local --target codex-local\n"
+    "  $ rrt skill install --target copilot-global --force --dry-run\n"
+    "  $ rrt skill install --target gemini-global"
+)
+
+# Ordered source-owned topic docs for docs generation.
+SOURCE_OWNED_TOPIC_DOCS: tuple[tuple[str, str], ...] = (("skill", __doc__ or ""),)
+
+
+def _show_available_install_targets(*, cwd: Path, home: Path) -> None:
+    p = DryRunPrinter(True)
+    p.blank_line()
+    p.header("Skill install", Skills=str(len(BUNDLED_SKILLS)))
+    p.section("Available targets")
+    for target_name, resolver in sorted(TARGET_PATHS.items()):
+        for skill in BUNDLED_SKILLS:
+            location = display_path(
+                resolver(cwd, home) / skill.name / "SKILL.md",
+                cwd=cwd,
+                home=home,
+            )
+            p.would_install(skill.name, target_name, location)
+    p.blank_line()
+    p.footer("pass --target DEST to install (see targets above)")
+
+
+@dataclass(frozen=True)
+class InstallOptions:
+    """Typed view of ``argparse.Namespace`` for ``rrt skill install``.
+
+    Built once via :meth:`from_args` at the top of :func:`cmd_install` so all
+    flags it reads have typed read sites instead of ``getattr(args, ...,
+    default)`` / ``args.x`` calls throughout the function body.
+    """
+
+    targets: list[str] | None
+    dry_run: bool
+    force: bool
+    verbose: int
+
+    @classmethod
+    def from_args(cls, args: argparse.Namespace) -> InstallOptions:
+        """Build an :class:`InstallOptions` from a parsed ``argparse.Namespace``.
+
+        ``targets``, ``dry_run``, and ``force`` are given real defaults by
+        skill.py's own register(), and every test in
+        tests/commands/test_skill.py that exercises cmd_install constructs
+        its Namespace with all three set explicitly, so they are read
+        directly. ``verbose`` is set globally by cli.py's parser, but no test
+        Namespace here ever sets it, so the getattr fallback here absorbs
+        that gap.
+        """
+        return cls(
+            targets=args.targets,
+            dry_run=args.dry_run,
+            force=args.force,
+            verbose=getattr(args, "verbose", 0) or 0,
+        )
+
+
+def cmd_install(args: argparse.Namespace) -> int:
+    """Install the bundled rrt user skills into one or more agent skill dirs."""
+    opts = InstallOptions.from_args(args)
+    verbose = opts.verbose
+    cwd = Path.cwd()
+    home = Path.home()
+    if not opts.targets:
+        if opts.dry_run:
+            _show_available_install_targets(cwd=cwd, home=home)
+            return 0
+        available = ", ".join(sorted(TARGET_PATHS))
+        return emit_install_error(
+            f"No --target specified. Pass --target DEST (e.g. --target claude-local). Available: {available}.",
+        )
+
+    install_plan = resolve_install_plan(opts.targets, TARGET_PATHS, cwd=cwd, home=home)
+
+    p = DryRunPrinter(opts.dry_run, verbose=verbose)
+    p.blank_line()
+    p.header(
+        "Skill install",
+        Skills=str(len(BUNDLED_SKILLS)),
+        Targets=str(len(install_plan)),
+    )
+
+    conflicts: list[tuple[str, str, Path]] = []
+    for target_name, skills_dir in install_plan:
+        for skill in BUNDLED_SKILLS:
+            destination = skills_dir / skill.name
+            if destination.exists() and not opts.force:
+                conflicts.append((target_name, skill.name, destination))
+
+    if conflicts:
+        for target_name, skill_name, destination in conflicts:
+            location = display_path(destination, cwd=cwd, home=home)
+            return emit_install_error(
+                f"{target_name} already has {skill_name} at {location}. Use --force to overwrite it.",
+            )
+
+    if opts.dry_run:
+        for target_name, skills_dir in install_plan:
+            for skill in BUNDLED_SKILLS:
+                destination = skills_dir / skill.name / "SKILL.md"
+                location = display_path(destination, cwd=cwd, home=home)
+                p.would_install(skill.name, target_name, location)
+        p.blank_line()
+        p.footer("no files were modified")
+        return 0
+
+    for target_name, skills_dir in install_plan:
+        for skill in BUNDLED_SKILLS:
+            destination_dir = skills_dir / skill.name
+            destination_file = destination_dir / "SKILL.md"
+            try:
+                if destination_dir.is_symlink() or destination_dir.is_file():
+                    destination_dir.unlink()
+                elif destination_dir.exists():
+                    shutil.rmtree(destination_dir)
+                destination_dir.mkdir(parents=True, exist_ok=True)
+                destination_file.write_text(skill.markdown.rstrip() + "\n", encoding="utf-8")
+            except OSError as exc:
+                location = display_path(destination_file, cwd=cwd, home=home)
+                return emit_install_error(
+                    f"Could not install {skill.name} to {target_name} ({location}): {exc}",
+                )
+            location = display_path(destination_file, cwd=cwd, home=home)
+            p.ok(f"Installed {skill.name} to {target_name}: {location}")
+    return 0
+
+
+@register_command(name="skill", category=CommandCategory.WRITE, group=CommandGroup.SETUP_TOOLING)
+def register(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    """Register the skill command group."""
+    parser = subparsers.add_parser(
+        "skill",
+        help="Install bundled rrt user workflow skills.",
+        description="Install the bundled rrt user workflow skills.",
+        epilog=SKILL_EXAMPLES,
+    )
+    skill_sub = parser.add_subparsers(
+        dest="skill_command",
+        metavar="<skill_command>",
+        parser_class=type(parser),
+        required=True,
+    )
+
+    install_parser = skill_sub.add_parser(
+        "install",
+        help="Install bundled rrt user skills into agent skill directories.",
+        description="Install the bundled rrt user skills into one or more local or global agent skill directories.",
+        epilog=SKILL_INSTALL_EXAMPLES,
+    )
+    install_parser.add_argument(
+        "--target",
+        dest="targets",
+        action="append",
+        required=False,
+        choices=sorted(TARGET_PATHS),
+        metavar="DEST",
+        help=(
+            "Install target. Repeat to install into multiple locations: "
+            "copilot-local, claude-local, codex-local, gemini-local, "
+            "copilot-global, claude-global, codex-global, gemini-global."
+        ),
+    )
+    add_dry_run_flag(install_parser)
+    install_parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Overwrite existing installed skill directories.",
+    )
+    install_parser.set_defaults(handler=cmd_install)

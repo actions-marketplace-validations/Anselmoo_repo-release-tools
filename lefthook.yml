@@ -1,0 +1,41 @@
+# lefthook.yml — git hooks powered by repo-release-tools
+# Setup: uv tool install repo-release-tools && lefthook install
+# Docs: https://github.com/Anselmoo/repo-release-tools/blob/main/docs/commands/hooks.md
+
+commit-msg:
+  commands:
+    rrt-update-unreleased:
+      # Auto-appends a conventional commit bullet to the [Unreleased] section
+      # of CHANGELOG.md and stages it — changelog equivalent of `ruff --fix`.
+      # feat/fix/refactor/perf commits are written; chore/ci/test are silent no-ops.
+      run: rrt-hooks update-unreleased --message-file {1}
+    rrt-commit-subject:
+      # {1} is the commit-msg file path (positional arg).
+      run: rrt-hooks commit-msg {1}
+
+pre-commit:
+  commands:
+    rrt-branch-name:
+      # Validates the active branch name against the project's branch policy.
+      run: rrt-hooks pre-commit
+    rrt-tree-auto-update:
+      # Auto-refreshes .rrt/tree.lock.toml and stages it when drift is detected.
+      run: rrt tree --check --strict || (rrt tree --snapshot && git add .rrt/tree.lock.toml)
+    rrt-doctor-auto-update:
+      # Auto-refreshes .rrt/health.lock.toml and stages it when health drift is detected.
+      run: rrt doctor --check --strict || (rrt doctor --snapshot && git add .rrt/health.lock.toml)
+
+pre-push:
+  commands:
+    rrt-changelog:
+      # Ensures [Unreleased] is non-empty before pushing — guards against commits
+      # that bypassed the commit-msg hooks (e.g. committed with --no-verify).
+      run: rrt-hooks check-changelog --subject "$(git log -1 --format=%s)" --strategy unreleased
+    rrt-tree-check:
+      # Auto-refreshes the snapshot on drift and blocks the push so the update can be committed.
+      run: |
+        if ! rrt tree --check --strict; then
+          rrt tree --snapshot && git add .rrt/tree.lock.toml
+          echo "↺  Snapshot auto-updated — commit .rrt/tree.lock.toml and push again."
+          exit 1
+        fi

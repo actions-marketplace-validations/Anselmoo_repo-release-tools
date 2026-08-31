@@ -1,0 +1,2024 @@
+"""Validators and entrypoints for branch, commit, and changelog policy checks."""
+
+from __future__ import annotations
+
+import argparse
+import re
+import sys
+from collections import Counter
+from pathlib import Path
+
+from repo_release_tools.changelog import (
+    SECTION_MAP,
+    ParsedCommit,
+    append_to_unreleased,
+    detect_changelog_format,
+    get_unreleased_entries,
+    parse_conventional_commit,
+)
+from repo_release_tools.commands._cli_shared import add_dry_run_flag
+from repo_release_tools.commands.artifacts_cmd import _add_artifacts_strict_argument, cmd_artifacts
+from repo_release_tools.commands.branch import (
+    BRANCH_SLUG_RE,
+    CONVENTIONAL_TYPES,
+    SLUG_MAX,
+    normalize_commit_type,
+)
+from repo_release_tools.commands.changelog_lint import cmd_changelog_lint
+from repo_release_tools.commands.config_cmd import cmd_config
+from repo_release_tools.commands.docs_cmd import (
+    _add_docs_generate_arguments,
+    _add_docs_inject_arguments,
+    _add_docs_map_arguments,
+    _add_docs_publish_arguments,
+    cmd_docs,
+)
+from repo_release_tools.commands.docs_suggest import cmd_docs_suggest
+from repo_release_tools.commands.doctor import cmd_doctor
+from repo_release_tools.commands.drift_cmd import _add_drift_lock_arguments
+from repo_release_tools.commands.drift_cmd import cmd_check as cmd_drift_check
+from repo_release_tools.commands.eol_check import cmd_eol as cmd_eol_check
+from repo_release_tools.commands.folder import _add_folder_check_arguments, cmd_folder_check
+from repo_release_tools.commands.git_sync import (
+    _add_publish_snapshot_arguments,
+    cmd_publish_snapshot,
+)
+from repo_release_tools.commands.release_cmd import cmd_release_check
+from repo_release_tools.commands.sync_cmd import cmd_sync
+from repo_release_tools.commands.tag import cmd_tag_check
+from repo_release_tools.commands.tree import cmd_tree
+from repo_release_tools.config import (
+    DEFAULT_CHANGELOG,
+    DEFAULT_CHANGELOG_WORKFLOW,
+    is_missing_tool_rrt_error,
+    load_extra_branch_types,
+    load_or_autodetect_config,
+)
+from repo_release_tools.ui import VerbosePrinter
+from repo_release_tools.version.semver import Version
+from repo_release_tools.workflow import git
+
+ALLOWED_BRANCH_NAMES = ("main", "master", "develop")
+MAGIC_BRANCH_TYPES = ("claude", "codex", "copilot")
+BOT_BRANCH_TYPES = ("dependabot", "renovate")
+ALLOWED_BRANCH_TYPES = (*CONVENTIONAL_TYPES, *MAGIC_BRANCH_TYPES, *BOT_BRANCH_TYPES)
+
+
+def validate_branch_name(
+    branch_name: str,
+    *,
+    extra_types: tuple[str, ...] = (),
+) -> str | None:
+    """Validate the current branch name."""
+    if not branch_name:
+        return None
+
+    if branch_name in ALLOWED_BRANCH_NAMES:
+        return None
+
+    if branch_name.startswith("release/v"):
+        version = branch_name.removeprefix("release/v")
+        try:
+            Version.parse(version)
+        except ValueError:
+            return f"Release branch {branch_name!r} must use release/v<semver>."
+        return None
+
+    if "/" not in branch_name:
+        return f"Branch {branch_name!r} must use <type>/<kebab-case-description>."
+
+    type_part, slug = branch_name.split("/", 1)
+    passthrough_types = (*MAGIC_BRANCH_TYPES, *BOT_BRANCH_TYPES, *extra_types)
+    if type_part not in passthrough_types:
+        try:
+            normalize_commit_type(type_part)
+        except argparse.ArgumentTypeError:
+            allowed = ", ".join((*ALLOWED_BRANCH_TYPES, *extra_types))
+            return f"Branch type {type_part!r} is invalid. Choose one of: {allowed}."
+
+    # Bot and passthrough branches (dependabot, renovate, extra_branch_types)
+    # use externally-generated slugs that may contain slashes and underscores,
+    # so skip slug format and length validation for them.
+    if type_part in (*BOT_BRANCH_TYPES, *extra_types):
+        if not slug:
+            return f"Branch {branch_name!r} must have a non-empty slug after '/'."
+        return None
+
+    if len(slug) > SLUG_MAX:
+        return f"Branch slug {slug!r} is too long ({len(slug)} > {SLUG_MAX})."
+
+    if not BRANCH_SLUG_RE.fullmatch(slug):
+        return (
+            f"Branch slug {slug!r} must be normalized kebab-case using only lowercase "
+            "letters, digits, and hyphens."
+        )
+
+    return None
+
+
+def read_commit_subject(message_file: Path) -> str:
+    """Read the first non-empty line from a commit message file."""
+    for line in message_file.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if stripped:
+            return stripped
+    return ""
+
+
+def validate_commit_subject(
+    subject: str,
+    extra_types: tuple[str, ...] = (),
+) -> str | None:
+    """Validate a commit subject against the project's conventional commit rules."""
+    if not subject:
+        return "Commit message is empty."
+
+    if subject.startswith("Merge "):
+        return None
+
+    if subject.startswith(("fixup! ", "squash! ")):
+        _, _, rewritten = subject.partition(" ")
+        if parse_conventional_commit(rewritten, extra_types) is not None:
+            return None
+
+    if parse_conventional_commit(subject, extra_types) is not None:
+        return None
+
+    allowed_types = (*CONVENTIONAL_TYPES, "deps", *extra_types)
+    allowed = ", ".join(allowed_types)
+    return (
+        "Commit subject must follow Conventional Commits, for example "
+        f"'feat(cli): add hook installer'. Allowed types: {allowed}."
+    )
+
+
+def _parse_subject_for_changelog(
+    subject: str,
+    extra_types: tuple[str, ...] = (),
+) -> ParsedCommit | None:
+    """Parse a commit subject while tolerating fixup and squash prefixes."""
+    candidate = subject
+    if candidate.startswith(("fixup! ", "squash! ")):
+        _, _, candidate = candidate.partition(" ")
+    return parse_conventional_commit(candidate, extra_types)
+
+
+def commit_type_requires_changelog(
+    commit_type: str,
+    *,
+    breaking: bool = False,
+    extra_section_map: dict[str, str] | None = None,
+) -> bool:
+    """Return whether a conventional commit type should update the changelog."""
+    if breaking:
+        return True
+    merged_map = {**SECTION_MAP, **(extra_section_map or {})}
+    section = merged_map.get(commit_type.lower())
+    return section is not None and section != "Maintenance"
+
+
+def branch_requires_changelog(branch_name: str) -> bool:
+    """Return whether a branch type should stage a changelog update."""
+    if (
+        not branch_name
+        or branch_name in ALLOWED_BRANCH_NAMES
+        or branch_name.startswith("release/v")
+    ):
+        return False
+    if "/" not in branch_name:
+        return False
+
+    type_part, _ = branch_name.split("/", 1)
+    try:
+        normalized_type = normalize_commit_type(type_part)
+    except argparse.ArgumentTypeError:
+        return False
+    return commit_type_requires_changelog(normalized_type)
+
+
+def commit_subject_requires_changelog(subject: str) -> bool:
+    """Return whether a commit subject should include a changelog update."""
+    parsed = _parse_subject_for_changelog(subject)
+    if parsed is None:
+        return False
+    return commit_type_requires_changelog(parsed.type, breaking=parsed.breaking)
+
+
+_CHANGELOG_META_RE = re.compile(
+    # "verb changelog[...]" — maintenance actions on the changelog file itself
+    r"\b(?:update|bump|revise|amend|correct|trim)\s+changelog\b"
+    # "changelog noun" — specific meta-nouns that describe changelog maintenance
+    r"|\bchangelog\s+(?:entries?|updates?|corrections?|formatting?)\b",
+    re.IGNORECASE,
+)
+
+
+def is_changelog_meta_commit(subject: str) -> bool:
+    """Return True when the commit description is itself about updating the changelog.
+
+    Prevents ``rrt-update-unreleased`` from adding a recursive bullet such as
+    ``- update changelog entries`` when someone commits a changelog correction
+    with a subject like ``fix: update changelog to reflect CI changes``.
+
+    Only commits whose *description* matches a narrow set of maintenance phrases
+    (e.g. "update changelog", "changelog entries") are treated as meta-commits,
+    so that genuine product changes whose names contain "changelog" (e.g.
+    ``feat: add changelog parser``) are not silently suppressed.
+    """
+    parsed = _parse_subject_for_changelog(subject)
+    if parsed is None:
+        return False
+    return bool(_CHANGELOG_META_RE.search(parsed.description))
+
+
+def _normalize_repo_path(path: str, *, cwd: Path) -> str:
+    """Normalize a path for comparisons against git output."""
+    candidate = Path(path)
+    if candidate.is_absolute():
+        try:
+            candidate = candidate.relative_to(cwd)
+        except ValueError:
+            pass
+    return candidate.as_posix()
+
+
+def _contained_changelog_path(changelog_file: str, *, cwd: Path) -> Path | None:
+    """Resolve *changelog_file* against *cwd* and reject paths that escape it.
+
+    SEC-003: ``changelog_file`` is config-controlled; without a containment
+    check a value such as ``"../../evil.md"`` would resolve outside the work
+    tree (CWE-22). Returns the resolved path when it is contained within
+    *cwd*, or ``None`` when it escapes.
+    """
+    resolved_cwd = cwd.resolve()
+    resolved_path = (cwd / changelog_file).resolve()
+    if resolved_path.is_relative_to(resolved_cwd):
+        return resolved_path
+    return None
+
+
+def staged_files(cwd: Path) -> list[str]:
+    """Return staged files for the current index."""
+    out = git.capture(["git", "diff", "--cached", "--name-only", "--diff-filter=ACMR"], cwd)
+    return [line.strip() for line in out.splitlines() if line.strip()]
+
+
+def changed_files_for_ref(cwd: Path, ref: str) -> list[str]:
+    """Return files changed by a single git ref, typically HEAD."""
+    out = git.capture(
+        ["git", "diff-tree", "--no-commit-id", "--name-only", "--root", "-r", ref],
+        cwd,
+    )
+    return [line.strip() for line in out.splitlines() if line.strip()]
+
+
+def changelog_is_updated(changed_files: list[str], *, changelog_file: str, cwd: Path) -> bool:
+    """Return whether the changelog file is included in the changed files."""
+    target = _normalize_repo_path(changelog_file, cwd=cwd)
+    return any(_normalize_repo_path(path, cwd=cwd) == target for path in changed_files)
+
+
+def _detect_changelog_workflow(cwd: Path) -> str:
+    """Return the configured changelog workflow, defaulting to incremental."""
+    try:
+        return load_or_autodetect_config(cwd).changelog_workflow
+    except FileNotFoundError:
+        return DEFAULT_CHANGELOG_WORKFLOW
+    except ValueError as exc:
+        if is_missing_tool_rrt_error(exc):
+            return DEFAULT_CHANGELOG_WORKFLOW
+        raise RuntimeError(f"Failed to load changelog_workflow configuration: {exc}") from exc
+
+
+def _resolve_changelog_strategy(cwd: Path, strategy: str) -> str:
+    """Resolve an explicit or workflow-derived changelog enforcement strategy."""
+    if strategy == "incremental":
+        return "per-commit"
+    if strategy != "auto":
+        return strategy
+    workflow = _detect_changelog_workflow(cwd)
+    return "release-only" if workflow == "squash" else "per-commit"
+
+
+# ---------------------------------------------------------------------------
+# Post-correction helpers
+# ---------------------------------------------------------------------------
+
+_OPPOSITE_VERB_PAIRS: list[tuple[str, str]] = [
+    ("add ", "remove "),
+    ("adds ", "removes "),
+    ("enable ", "disable "),
+    ("enables ", "disables "),
+    ("include ", "exclude "),
+    ("includes ", "excludes "),
+    ("upgrade ", "downgrade "),
+    ("upgrades ", "downgrades "),
+    ("revert ", "apply "),
+    ("reverts ", "applies "),
+]
+
+# Matches a leading "SCOPE: " prefix in a changelog bullet description.
+# Scope identifiers are restricted to alphanumeric characters, underscores,
+# and hyphens to avoid false matches on entries that happen to contain a colon.
+_SCOPE_PREFIX_RE = re.compile(r"^([A-Za-z0-9_-]+):\s+(.+)$")
+
+
+def _split_scope(text: str) -> tuple[str | None, str]:
+    """Split a bullet description into ``(scope_lower, rest)`` or ``(None, text)``."""
+    m = _SCOPE_PREFIX_RE.match(text)
+    if m:
+        return m.group(1).lower(), m.group(2)
+    return None, text
+
+
+def collect_squash_changelog_hunks(
+    cwd: Path,
+    ref: str = "HEAD",
+    changelog_file: str = DEFAULT_CHANGELOG,
+) -> tuple[list[str], frozenset[int]]:
+    """Return ``(added_lines, added_line_positions)`` for *changelog_file* in *ref*.
+
+    *added_lines* are the content lines (without the leading ``+``) that the
+    commit introduced.  *added_line_positions* is the set of 1-based line
+    numbers those additions occupy in the post-commit file, parsed from the
+    ``@@ ... @@`` hunk headers so that
+    :func:`apply_dedup_to_changelog` can restrict removals to the exact
+    squash hunk rather than scanning the whole file.
+    """
+    out = git.capture_checked(
+        ["git", "show", "--format=", ref, "--", changelog_file],
+        cwd,
+    )
+    added: list[str] = []
+    positions: set[int] = set()
+    current_new_line = 0
+
+    for line in out.splitlines():
+        if line.startswith(("diff ", "index ", "--- ", "+++ ")):
+            continue
+        if line.startswith("@@ "):
+            m = re.match(r"@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@", line)
+            if m:
+                current_new_line = int(m.group(1)) - 1
+            continue
+        if line.startswith("+"):
+            current_new_line += 1
+            added.append(line[1:])
+            positions.add(current_new_line)
+        elif line.startswith(" "):
+            current_new_line += 1
+        # "-" lines: only in old file; new-file counter does not advance
+
+    return added, frozenset(positions)
+
+
+def _entries_cancel_out(a: str, b: str) -> bool:
+    """Return ``True`` if two bullet-entry descriptions are semantic opposites.
+
+    For example ``"add Node 26"`` / ``"remove Node 26"`` cancel each other
+    out, and so do ``"CI: add Node 26"`` / ``"CI: remove Node 26"``.
+
+    Entries with different scope prefixes (e.g. ``"CI: …"`` vs ``"Deps: …"``)
+    are never considered cancelling pairs even if their verb+subject match.
+    """
+    a_scope, a_rest = _split_scope(a)
+    b_scope, b_rest = _split_scope(b)
+    if a_scope != b_scope:
+        return False
+
+    a_lower = a_rest.lower()
+    b_lower = b_rest.lower()
+    for v1, v2 in _OPPOSITE_VERB_PAIRS:
+        rest_a_v1 = a_lower.removeprefix(v1)
+        rest_b_v2 = b_lower.removeprefix(v2)
+        if rest_a_v1 != a_lower and rest_b_v2 != b_lower and rest_a_v1 == rest_b_v2:
+            return True
+        rest_a_v2 = a_lower.removeprefix(v2)
+        rest_b_v1 = b_lower.removeprefix(v1)
+        if rest_a_v2 != a_lower and rest_b_v1 != b_lower and rest_a_v2 == rest_b_v1:
+            return True
+    return False
+
+
+def dedup_changelog_entries(added_lines: list[str]) -> list[str]:
+    """Remove duplicate and contradicting bullet entries from *added_lines*.
+
+    Non-bullet lines (headers, blank lines, etc.) are preserved as-is.
+    Among bullet lines:
+
+    * Exact duplicates (case-insensitive) are collapsed to the first occurrence.
+    * Pairs of entries whose descriptions are semantic opposites (e.g.
+      ``"add X"`` / ``"remove X"``) are both removed.
+
+    Consecutive blank lines produced by the removal are collapsed to a single
+    blank line.
+    """
+    # Split lines into indices of bullets vs. structural lines
+    bullet_indices: list[int] = []
+    for i, line in enumerate(added_lines):
+        if line.strip().startswith("- "):
+            bullet_indices.append(i)
+
+    # Deduplicate bullets (case-insensitive exact match) — keep first occurrence
+    seen_keys: set[str] = set()
+    duplicate_indices: set[int] = set()
+    for i in bullet_indices:
+        key = added_lines[i].strip().lower()
+        if key in seen_keys:
+            duplicate_indices.add(i)
+        else:
+            seen_keys.add(key)
+
+    # Detect cancelling pairs among the remaining (non-duplicate) bullets
+    remaining_bullets = [
+        (i, added_lines[i].strip()[2:].strip())
+        for i in bullet_indices
+        if i not in duplicate_indices
+    ]
+    # Detect cancelling pairs — O(n) via verb-keyed lookup instead of O(n²) pairs.
+    # Maps (scope, verb, suffix) → original line index for bullets not yet cancelled.
+    bullet_lookup: dict[tuple[str | None, str, str], int] = {}
+    cancelled_indices: set[int] = set()
+    for i, desc in remaining_bullets:
+        scope, rest = _split_scope(desc)
+        rest_lower = rest.lower()
+        cancelled = False
+        for v1, v2 in _OPPOSITE_VERB_PAIRS:
+            for own_verb, opp_verb in ((v1, v2), (v2, v1)):
+                if not rest_lower.startswith(own_verb):
+                    continue
+                suffix = rest_lower[len(own_verb) :]
+                j = bullet_lookup.get((scope, opp_verb, suffix))
+                if j is not None and j not in cancelled_indices:
+                    cancelled_indices.update((i, j))
+                    cancelled = True
+                    break
+            if cancelled:
+                break
+        if not cancelled:
+            for v1, v2 in _OPPOSITE_VERB_PAIRS:
+                for verb in (v1, v2):
+                    if rest_lower.startswith(verb):
+                        bullet_lookup.setdefault((scope, verb, rest_lower[len(verb) :]), i)
+
+    remove_indices = duplicate_indices | cancelled_indices
+
+    if not remove_indices:
+        return list(added_lines)
+
+    result = [line for i, line in enumerate(added_lines) if i not in remove_indices]
+
+    # Collapse consecutive blank lines
+    cleaned: list[str] = []
+    prev_blank = False
+    for line in result:
+        is_blank = not line.strip()
+        if is_blank and prev_blank:
+            continue
+        cleaned.append(line)
+        prev_blank = is_blank
+
+    return cleaned
+
+
+def apply_dedup_to_changelog(
+    changelog_path: Path,
+    added_lines: list[str],
+    deduped_lines: list[str],
+    *,
+    added_line_positions: frozenset[int] | None = None,
+) -> bool:
+    """Rewrite *changelog_path* removing entries that were filtered out.
+
+    Uses a :class:`~collections.Counter` diff to decide how many times each
+    line should be removed.  When *added_line_positions* is provided (1-based
+    line numbers of the squash-commit additions), removals are restricted to
+    those positions so that identical lines in older release sections are never
+    accidentally deleted.
+
+    Returns ``True`` when the file was modified, ``False`` when nothing
+    changed.
+    """
+    added_counter = Counter(added_lines)
+    deduped_counter = Counter(deduped_lines)
+    to_remove = added_counter - deduped_counter
+
+    if not to_remove:
+        return False
+
+    content = changelog_path.read_text(encoding="utf-8")
+    removal_budget: dict[str, int] = dict(to_remove)
+
+    result_lines: list[str] = []
+    for line_idx, raw_line in enumerate(content.splitlines(keepends=True), start=1):
+        key = raw_line.rstrip("\n")
+        in_hunk = added_line_positions is None or line_idx in added_line_positions
+        if in_hunk and removal_budget.get(key, 0) > 0:
+            removal_budget[key] -= 1
+            continue
+        result_lines.append(raw_line)
+
+    # Collapse consecutive blank lines that may result from the removal
+    cleaned: list[str] = []
+    prev_blank = False
+    for line in result_lines:
+        is_blank = not line.strip()
+        if is_blank and prev_blank:
+            continue
+        cleaned.append(line)
+        prev_blank = is_blank
+
+    new_content = "".join(cleaned)
+    if new_content == content:
+        return False
+    changelog_path.write_text(new_content, encoding="utf-8")
+    return True
+
+
+def emit_failure(title: str, details: list[str]) -> int:
+    """Render a hook failure message and return a non-zero exit code."""
+    p = VerbosePrinter()
+    p.line(title, ok=False, stream=sys.stderr)
+    for detail in details:
+        p.action(detail, stream=sys.stderr)
+    return 1
+
+
+def run_branch_name_check(
+    branch_name: str,
+    *,
+    title: str,
+    extra_types: tuple[str, ...] = (),
+    verbose: int = 0,
+) -> int:
+    """Validate an explicit branch name."""
+    p = VerbosePrinter(verbose=verbose)
+    p.verbose_line(f"check-branch-name: {branch_name!r}")
+    problem = validate_branch_name(branch_name, extra_types=extra_types)
+    if problem is None:
+        p.verbose_line("  branch name OK")
+        return 0
+
+    all_types = (*ALLOWED_BRANCH_TYPES, *extra_types)
+    p.verbose_line(f"  allowed types: {', '.join(all_types)}", level=2)
+    return emit_failure(
+        title,
+        [
+            problem,
+            "Expected: <type>/<kebab-case-description>.",
+            (
+                "Allowed types: "
+                f"{', '.join(all_types)} "
+                "(including AI helper branches: claude, codex, copilot"
+                " and bot branches: dependabot, renovate)."
+            ),
+            f"Also allowed: {', '.join(ALLOWED_BRANCH_NAMES)}, release/v<semver>.",
+        ],
+    )
+
+
+def run_commit_subject_check(subject: str, *, title: str, verbose: int = 0) -> int:
+    """Validate an explicit commit subject."""
+    p = VerbosePrinter(verbose=verbose)
+    p.verbose_line(f"check-commit-subject: {subject!r}")
+    parsed_commit = parse_conventional_commit(subject)
+    if parsed_commit is not None:
+        p.verbose_line(
+            f"  type={parsed_commit.type!r}, scope={parsed_commit.scope!r}",
+            level=2,
+        )
+    problem = validate_commit_subject(subject)
+    if problem is None:
+        p.verbose_line("  subject OK")
+        return 0
+
+    return emit_failure(
+        title,
+        [
+            problem,
+            f"Found subject: {subject!r}.",
+        ],
+    )
+
+
+def run_dirty_tree_check(cwd: Path, *, title: str, verbose: int = 0) -> int:
+    """Validate that the working tree is clean."""
+    p = VerbosePrinter(verbose=verbose)
+    p.verbose_line("check-dirty-tree")
+    if not git.is_git_repository(cwd):
+        return emit_failure(
+            title,
+            [f"{cwd} is not inside a Git work tree."],
+        )
+
+    if git.working_tree_clean(cwd):
+        p.verbose_line("  working tree clean")
+        return 0
+
+    try:
+        lines = git.status_porcelain(cwd)
+    except RuntimeError as exc:
+        return emit_failure(title, [str(exc)])
+    return emit_failure(
+        title,
+        [
+            "Working tree has uncommitted changes.",
+            (f"Changed entries: {', '.join(lines) if lines else '<unavailable>'}."),
+        ],
+    )
+
+
+def run_docs_check(cwd: Path, lock_file: str = ".rrt/docs.lock.toml", verbose: int = 0) -> int:
+    """Fail if source-owned docs have drifted from the lockfile."""
+    p = VerbosePrinter(verbose=verbose)
+    p.verbose_line("check-docs")
+    from collections import defaultdict
+
+    from repo_release_tools.config import DocsConfig
+    from repo_release_tools.docs.extractor import DocEntry, extract_docs_from_dir
+    from repo_release_tools.state import docs_lock_path, hash_content, lock_is_current
+
+    try:
+        from repo_release_tools.config import load_config
+
+        cfg = load_config(cwd)
+        doc_config = cfg.docs if cfg.docs is not None else DocsConfig()
+        effective_lock = lock_file if lock_file != ".rrt/docs.lock.toml" else doc_config.lock_file
+    except Exception as exc:  # noqa: BLE001
+        if is_missing_tool_rrt_error(exc):
+            doc_config = DocsConfig()
+            effective_lock = lock_file
+        else:
+            return emit_failure(
+                "Failed to load repo-release-tools configuration for docs check.",
+                [str(exc)],
+            )
+
+    entries = extract_docs_from_dir(cwd, doc_config)
+    by_file: dict[str, list[DocEntry]] = defaultdict(list)
+    for entry in entries:
+        by_file[entry.source_file].append(entry)
+
+    sources = []
+    for src_file, src_entries in by_file.items():
+        combined = "".join(e.hash for e in sorted(src_entries, key=lambda e: e.name))
+        sources.append(
+            {
+                "source_file": src_file,
+                "hash": hash_content(combined),
+                "symbols": [e.name for e in src_entries],
+                "lang": src_entries[0].lang,
+            },
+        )
+
+    lock_path = docs_lock_path(cwd, effective_lock)
+    is_current, messages = lock_is_current(lock_path, sources)
+    if is_current:
+        p.verbose_line("  docs lockfile up to date")
+        return 0
+    return emit_failure(
+        "Docs lockfile is stale — run 'rrt docs generate --format toml' to update.",
+        messages,
+    )
+
+
+def run_pre_commit(cwd: Path, *, verbose: int = 0) -> int:
+    """Validate the active branch during pre-commit."""
+    p = VerbosePrinter(verbose=verbose)
+    branch_name = git.current_branch(cwd)
+    p.verbose_line(f"pre-commit: branch={branch_name!r}")
+    extra_types = load_extra_branch_types(cwd)
+    p.verbose_line(f"  extra branch types: {extra_types}", level=3)
+    return run_branch_name_check(
+        branch_name,
+        title="Commit blocked by branch naming policy.",
+        extra_types=extra_types,
+        verbose=verbose,
+    )
+
+
+def run_pre_commit_changelog(
+    cwd: Path, *, changelog_file: str = DEFAULT_CHANGELOG, verbose: int = 0
+) -> int:
+    """Validate staged changelog updates during pre-commit."""
+    p = VerbosePrinter(verbose=verbose)
+    p.verbose_line("pre-commit-changelog")
+    try:
+        workflow = _detect_changelog_workflow(cwd)
+        p.verbose_line(f"  workflow: {workflow}", level=2)
+        if workflow == "squash":
+            p.verbose_line("  skipped (squash workflow)")
+            return 0
+    except RuntimeError as exc:
+        return emit_failure("Commit blocked by changelog policy.", [str(exc)])
+
+    branch_name = git.current_branch(cwd)
+    if not branch_requires_changelog(branch_name):
+        p.verbose_line(f"  skipped (branch {branch_name!r} does not require changelog)")
+        return 0
+
+    changed_files = staged_files(cwd)
+    p.verbose_line(f"  staged files: {changed_files}", level=2)
+    if changelog_is_updated(changed_files, changelog_file=changelog_file, cwd=cwd):
+        p.verbose_line("  changelog updated in staged files")
+        return 0
+
+    normalized_path = _normalize_repo_path(changelog_file, cwd=cwd)
+    return emit_failure(
+        "Commit blocked by changelog policy.",
+        [
+            f"Branch {branch_name!r} requires a staged changelog update.",
+            f"Stage {normalized_path} before committing.",
+            f"Currently staged files: {', '.join(changed_files) if changed_files else '<none>'}.",
+        ],
+    )
+
+
+def run_commit_msg(message_path: Path, *, verbose: int = 0) -> int:
+    """Validate the commit subject during commit-msg."""
+    subject = read_commit_subject(message_path)
+    p = VerbosePrinter(verbose=verbose)
+    p.verbose_line(f"commit-msg: file={message_path!s}", level=2)
+    return run_commit_subject_check(
+        subject,
+        title="Commit blocked by commit message policy.",
+        verbose=verbose,
+    )
+
+
+def run_update_unreleased(
+    cwd: Path,
+    *,
+    subject: str,
+    changelog_file: str = DEFAULT_CHANGELOG,
+    verbose: int = 0,
+) -> int:
+    """Append a parsed bullet to the [Unreleased] section for changelog-relevant commits.
+
+    Creates the ``[Unreleased]`` section at the top of the changelog when it
+    does not yet exist.  If the changelog content changes, writes the updated
+    file and stages it. Returns 0 for non-changelog commits and successful
+    updates, but returns ``emit_failure(...)`` if the changelog file is
+    missing.
+    """
+    p = VerbosePrinter(verbose=verbose)
+    p.verbose_line(f"update-unreleased: subject={subject!r}")
+    try:
+        workflow = _detect_changelog_workflow(cwd)
+        p.verbose_line(f"  workflow: {workflow}", level=2)
+        if workflow == "squash":
+            p.verbose_line("  skipped (squash workflow)")
+            return 0
+    except RuntimeError as exc:
+        return emit_failure("Changelog update failed.", [str(exc)])
+
+    if not commit_subject_requires_changelog(subject):
+        p.verbose_line("  skipped (non-changelog commit type)")
+        return 0
+    if is_changelog_meta_commit(subject):
+        p.verbose_line("  skipped (changelog meta-commit)")
+        return 0
+
+    changelog_path = _contained_changelog_path(changelog_file, cwd=cwd)
+    if changelog_path is None:
+        return emit_failure(
+            "Changelog update failed.",
+            [f"Changelog file {changelog_file!r} resolves outside the repository root {cwd}."],
+        )
+    if not changelog_path.exists():
+        return emit_failure(
+            "Changelog update failed.",
+            [f"Changelog file {changelog_file!r} not found in {cwd}."],
+        )
+
+    original = changelog_path.read_text(encoding="utf-8")
+    fmt = detect_changelog_format(changelog_file)
+    p.verbose_line(f"  format: {fmt}", level=2)
+    updated = append_to_unreleased(original, subject, fmt)
+    if updated != original:
+        changelog_path.write_text(updated, encoding="utf-8")
+        git.run(["git", "add", "--", changelog_file], cwd, dry_run=False, label="stage changelog")
+        p = VerbosePrinter(verbose=verbose)
+        p.line(f"[Unreleased] section updated in {changelog_file}.", ok=True, stream=sys.stderr)
+    else:
+        p.verbose_line("  no change (already up to date)")
+    return 0
+
+
+def run_changelog_check(
+    subject: str,
+    *,
+    cwd: Path,
+    changelog_file: str = DEFAULT_CHANGELOG,
+    changed_files: list[str] | None = None,
+    ref: str = "HEAD",
+    title: str,
+    strategy: str = "auto",
+    branch: str = "",
+    verbose: int = 0,
+) -> int:
+    """Validate that changelog-relevant commits update the changelog file.
+
+    *strategy* controls what constitutes a valid changelog update:
+
+    ``auto`` (default)
+        Derives the strategy from ``changelog_workflow``. ``incremental`` maps
+        to ``per-commit`` and ``squash`` maps to ``release-only``.
+    ``incremental``
+        Compatibility alias for ``per-commit``.
+    ``per-commit``
+        The changelog file must appear in the commit's changed file list.
+    ``unreleased``
+        The changelog file must contain a non-empty ``[Unreleased]`` section.
+    ``release-only``
+        The check is skipped entirely (changelog updated only at release time).
+
+    When *branch* matches a known bot prefix (``renovate/*``,
+    ``dependabot/*``) the check is also skipped.
+    """
+    p = VerbosePrinter(verbose=verbose)
+    p.verbose_line(f"check-changelog: subject={subject!r}")
+    if not commit_subject_requires_changelog(subject):
+        p.verbose_line("  skipped (non-changelog commit type)")
+        return 0
+
+    # Skip for automated bot branches regardless of strategy.
+    if branch:
+        branch_prefix = branch.split("/", 1)[0]
+        if branch_prefix in BOT_BRANCH_TYPES:
+            p.verbose_line(f"  skipped (bot branch: {branch!r})")
+            return 0
+
+    try:
+        effective_strategy = _resolve_changelog_strategy(cwd, strategy)
+    except RuntimeError as exc:
+        return emit_failure(title, [str(exc)])
+
+    p.verbose_line(f"  strategy: {strategy} → {effective_strategy}", level=2)
+    if effective_strategy == "release-only":
+        p.verbose_line("  skipped (release-only strategy)")
+        return 0
+
+    normalized_path = _normalize_repo_path(changelog_file, cwd=cwd)
+    p.verbose_line(f"  changelog: {normalized_path}", level=2)
+
+    if effective_strategy == "unreleased":
+        changelog_path = cwd / changelog_file
+        if changelog_path.exists():
+            content = changelog_path.read_text(encoding="utf-8")
+            fmt = detect_changelog_format(changelog_file)
+            if get_unreleased_entries(content, fmt):
+                p.verbose_line("  [Unreleased] section OK")
+                return 0
+        return emit_failure(
+            title,
+            [
+                f"Commit subject {subject!r} requires a changelog update.",
+                f"Expected {normalized_path} to contain a non-empty [Unreleased] section.",
+                "Run 'rrt-hooks update-unreleased' or add entries under '## [Unreleased]' manually.",
+            ],
+        )
+
+    # effective_strategy == "per-commit"
+    effective_changed_files = (
+        changed_files if changed_files is not None else changed_files_for_ref(cwd, ref)
+    )
+    p.verbose_line(f"  changed files: {effective_changed_files}", level=2)
+    if changelog_is_updated(effective_changed_files, changelog_file=changelog_file, cwd=cwd):
+        p.verbose_line("  changelog updated OK")
+        return 0
+
+    return emit_failure(
+        title,
+        [
+            f"Commit subject {subject!r} requires a changelog update.",
+            f"Expected {normalized_path} to be part of the change set.",
+            (
+                "Changed files: "
+                f"{', '.join(effective_changed_files) if effective_changed_files else '<none>'}."
+            ),
+        ],
+    )
+
+
+def run_post_correct(
+    cwd: Path,
+    *,
+    ref: str = "HEAD",
+    changelog_file: str = DEFAULT_CHANGELOG,
+    commit: bool = False,
+    verbose: int = 0,
+) -> int:
+    """Consolidate fragmented changelog entries after a squash merge.
+
+    Inspects the diff that *ref* introduced to *changelog_file*, removes
+    duplicate and semantically-cancelling bullet entries (e.g. ``"add X"``
+    followed by ``"remove X"``), rewrites the file in-place, and optionally
+    creates a follow-up commit.
+    """
+    changelog_path = _contained_changelog_path(changelog_file, cwd=cwd)
+    if changelog_path is None:
+        return emit_failure(
+            "Changelog post-correction failed.",
+            [f"Changelog file {changelog_file!r} resolves outside the repository root {cwd}."],
+        )
+    if not changelog_path.exists():
+        return emit_failure(
+            "Changelog post-correction failed.",
+            [f"Changelog file {changelog_file!r} not found in {cwd}."],
+        )
+
+    try:
+        added_lines, positions = collect_squash_changelog_hunks(
+            cwd,
+            ref=ref,
+            changelog_file=changelog_file,
+        )
+    except RuntimeError as exc:
+        return emit_failure("Changelog post-correction failed.", [str(exc)])
+    if not added_lines:
+        p = VerbosePrinter(verbose=verbose)
+        p.line(
+            f"No changelog changes found in {ref!r}. Nothing to correct.",
+            ok=True,
+            stream=sys.stderr,
+        )
+        return 0
+
+    deduped_lines = dedup_changelog_entries(added_lines)
+
+    changed = apply_dedup_to_changelog(
+        changelog_path,
+        added_lines,
+        deduped_lines,
+        added_line_positions=positions,
+    )
+    if not changed:
+        p = VerbosePrinter(verbose=verbose)
+        p.line("Changelog is already clean. Nothing to correct.", ok=True, stream=sys.stderr)
+        return 0
+
+    removed_count = len(added_lines) - len(deduped_lines)
+    noun = "entry" if removed_count == 1 else "entries"
+    p = VerbosePrinter(verbose=verbose)
+    p.line(
+        f"Post-correction: removed {removed_count} duplicate/contradicting changelog {noun}.",
+        ok=True,
+        stream=sys.stderr,
+    )
+
+    if commit:
+        try:
+            git.run(
+                ["git", "add", "--", changelog_file],
+                cwd,
+                dry_run=False,
+                label="git add changelog",
+            )
+            git.run(
+                [
+                    "git",
+                    "commit",
+                    "-m",
+                    "chore: post-correct changelog after squash merge [skip ci]",
+                ],
+                cwd,
+                dry_run=False,
+                label="git commit",
+            )
+        except RuntimeError as exc:
+            return emit_failure("Changelog post-correction commit failed.", [str(exc)])
+
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    """CLI entrypoint for git hook execution."""
+    parser = argparse.ArgumentParser(prog="python -m repo_release_tools.workflow.hooks")
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="count",
+        default=0,
+        help="Increase output verbosity (-v summary, -vv details, -vvv debug).",
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    pre_commit_parser = subparsers.add_parser("pre-commit", help="Validate the active branch.")
+    pre_commit_parser.add_argument("filenames", nargs="*", help=argparse.SUPPRESS)
+
+    changelog_pre_commit_parser = subparsers.add_parser(
+        "pre-commit-changelog",
+        help="Validate staged changelog updates for the active branch.",
+    )
+    changelog_pre_commit_parser.add_argument("filenames", nargs="*", help=argparse.SUPPRESS)
+    changelog_pre_commit_parser.add_argument(
+        "--changelog-file",
+        default=DEFAULT_CHANGELOG,
+        help="Changelog path to enforce.",
+    )
+
+    commit_msg_parser = subparsers.add_parser("commit-msg", help="Validate a commit message file.")
+    commit_msg_parser.add_argument("message_file", help="Path to the commit message file.")
+
+    branch_check_parser = subparsers.add_parser(
+        "check-branch-name",
+        help="Validate an explicit branch name.",
+    )
+    branch_check_parser.add_argument("--branch", required=True, help="Branch name to validate.")
+
+    subject_check_parser = subparsers.add_parser(
+        "check-commit-subject",
+        help="Validate an explicit commit subject.",
+    )
+    subject_check_parser.add_argument(
+        "--subject",
+        required=True,
+        help="Commit subject to validate.",
+    )
+
+    changelog_check_parser = subparsers.add_parser(
+        "check-changelog",
+        help="Validate that a changelog-relevant commit updates the changelog.",
+    )
+    changelog_check_parser.add_argument(
+        "--subject",
+        required=True,
+        help="Commit subject to evaluate for changelog enforcement.",
+    )
+    changelog_check_parser.add_argument(
+        "--changelog-file",
+        default=DEFAULT_CHANGELOG,
+        help="Changelog path to enforce.",
+    )
+    changelog_check_parser.add_argument(
+        "--changed-file",
+        action="append",
+        dest="changed_files",
+        help="Explicit changed file path. May be provided multiple times.",
+    )
+    changelog_check_parser.add_argument(
+        "--ref",
+        default="HEAD",
+        help="Git ref whose changed files should be inspected when --changed-file is omitted.",
+    )
+    changelog_check_parser.add_argument(
+        "--strategy",
+        default="auto",
+        choices=["auto", "incremental", "per-commit", "unreleased", "release-only"],
+        help=(
+            "Changelog enforcement strategy: "
+            "'auto' (default) derives from changelog_workflow; "
+            "'incremental' is an alias for 'per-commit'; "
+            "'per-commit' requires the changelog in the changed-file list; "
+            "'unreleased' requires a non-empty [Unreleased] section; "
+            "'release-only' skips the check entirely."
+        ),
+    )
+    changelog_check_parser.add_argument(
+        "--branch",
+        default="",
+        help="Current branch name; bot branches (renovate/*, dependabot/*) skip the check.",
+    )
+
+    update_unreleased_parser = subparsers.add_parser(
+        "update-unreleased",
+        help="Append a parsed bullet to the [Unreleased] changelog section.",
+    )
+    update_unreleased_parser.add_argument(
+        "--subject",
+        default=None,
+        help=(
+            "Commit subject to parse. "
+            "Defaults to reading the first non-empty line of COMMIT_EDITMSG."
+        ),
+    )
+    update_unreleased_parser.add_argument(
+        "--message-file",
+        default=None,
+        metavar="PATH",
+        help=(
+            "Path to the commit message file. "
+            "When provided, the subject is read from this file instead of "
+            ".git/COMMIT_EDITMSG. Takes priority over --subject."
+        ),
+    )
+    update_unreleased_parser.add_argument(
+        "--changelog-file",
+        default=DEFAULT_CHANGELOG,
+        help="Changelog path to update.",
+    )
+
+    subparsers.add_parser(
+        "check-dirty-tree",
+        help="Validate that the current working tree is clean.",
+    )
+
+    subparsers.add_parser(
+        "check-docs",
+        help="Fail if source-owned docs have drifted from the lockfile.",
+    )
+
+    subparsers.add_parser(
+        "doctor",
+        help="Health-check the rrt configuration for the current repository.",
+    )
+    subparsers.add_parser(
+        "release-check",
+        help="Run release-target health checks for the current repository.",
+    )
+
+    changelog_parser = subparsers.add_parser(
+        "changelog",
+        help="Changelog management commands.",
+    )
+    subparsers.add_parser(
+        "check-eol",
+        help="Check host runtimes and project minimums against EOL dates.",
+    )
+    # Flags for each docs-* subcommand below are the single source of truth in
+    # commands/docs_cmd.py (_add_docs_*_arguments), shared with the
+    # corresponding `rrt docs <action>` subparser built in its own register().
+    # Each hooks.py subcommand maps to exactly one fixed `docs <action>` (not
+    # the full `docs` command with all its actions), so the parser here still
+    # only exposes that one action's flags -- no new user-facing flags versus
+    # before, just no more hand-copied field lists.
+    docs_generate_parser = subparsers.add_parser(
+        "docs-generate",
+        help="Regenerate the source-owned docs lockfile.",
+    )
+    _add_docs_generate_arguments(docs_generate_parser)
+    docs_generate_parser.set_defaults(format="toml")
+
+    docs_publish_parser = subparsers.add_parser(
+        "docs-publish",
+        help="Regenerate CLI reference documentation.",
+    )
+    _add_docs_publish_arguments(docs_publish_parser)
+
+    docs_inject_parser = subparsers.add_parser(
+        "docs-inject",
+        help="Synchronize shared anchor blocks across documentation.",
+    )
+    _add_docs_inject_arguments(docs_inject_parser)
+    docs_inject_parser.set_defaults(add_anchors=True)
+
+    docs_map_update_parser = subparsers.add_parser(
+        "docs-map-update",
+        help="Regenerate per-directory purpose docs (rrt docs map).",
+    )
+    _add_docs_map_arguments(docs_map_update_parser)
+
+    docs_map_check_parser = subparsers.add_parser(
+        "docs-map-check",
+        help="Fail if any per-directory purpose doc is stale.",
+    )
+    _add_docs_map_arguments(docs_map_check_parser)
+    docs_map_check_parser.set_defaults(check=True)
+    subparsers.add_parser(
+        "docstring-suggest",
+        help="Apply scaffolded docstrings to missing or thin module docstrings.",
+    )
+    subparsers.add_parser(
+        "tree-check",
+        help="Validate project tree structure against .rrt/tree.lock.toml (strict).",
+    )
+    drift_check_parser = subparsers.add_parser(
+        "drift-check",
+        help="Verify agent-surface drift lockfile is current (rrt drift check).",
+    )
+    # Flags are the single source of truth in commands/drift_cmd.py, shared
+    # with `rrt drift check`'s own register(). hooks.py previously hand-built
+    # a partial argparse.Namespace(root=".", lock_file="drift.lock.toml",
+    # verbose=verbose) here instead of parsing real flags — this now parses a
+    # real, complete Namespace so --root/--lock-file overrides are possible
+    # from the hooks surface too (previously silently ignored/unsupported).
+    _add_drift_lock_arguments(drift_check_parser)
+
+    sync_parser = subparsers.add_parser(
+        "sync",
+        help="List upstream releases newer than the current version.",
+    )
+    sync_parser.add_argument(
+        "--group",
+        default=None,
+        metavar="GROUP",
+        help="Version group name (default: first/default group).",
+    )
+    sync_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit a JSON array of newer version strings instead of one-per-line output.",
+    )
+    add_dry_run_flag(
+        sync_parser, help_text="Preview without side effects (informational; sync is read-only)."
+    )
+
+    publish_snapshot_parser = subparsers.add_parser(
+        "publish-snapshot",
+        help="Force-push a single-commit snapshot of tracked content to a secondary remote.",
+    )
+    # Flags are the single source of truth in commands/git_sync.py, shared with
+    # `rrt git publish-snapshot`'s own register_sync() — see
+    # _add_publish_snapshot_arguments's docstring for why this used to be a
+    # copy-pasted block here (pylint R0801) that could silently drift.
+    _add_publish_snapshot_arguments(publish_snapshot_parser)
+
+    subparsers.add_parser(
+        "config-validate",
+        help="Validate [tool.rrt] config (version/pin targets + structure).",
+    )
+    subparsers.add_parser(
+        "config-reference-check",
+        help="Verify docs/rrt-config-reference.toml is current.",
+    )
+    subparsers.add_parser(
+        "changelog-lint",
+        help="Lint [Unreleased] changelog entries for style violations (hard-fail).",
+    )
+    subparsers.add_parser(
+        "tag-check",
+        help="Validate existing git tags follow the configured naming convention (advisory).",
+    )
+
+    folder_check_parser = subparsers.add_parser(
+        "folder-check",
+        help="Validate repository folder structure against configured rules or templates.",
+    )
+    # Flags are the single source of truth in commands/folder.py, shared with
+    # `rrt folder check`'s own register(). This also unifies previously
+    # slightly-different help text between the two copy-pasted specs.
+    _add_folder_check_arguments(folder_check_parser)
+
+    artifacts_check_parser = subparsers.add_parser(
+        "artifacts-check",
+        help="Verify artifact hashes match the committed lock (strict by default).",
+    )
+    # The `strict` dest is the single source of truth in commands/artifacts_cmd.py
+    # (_add_artifacts_strict_argument), shared with `rrt artifacts`'s own
+    # register() -- this surface just wants the opposite default/polarity
+    # (fail-closed CI gate vs. opt-in --strict for humans), which the helper
+    # takes as a parameter instead of hand-declaring a second --no-strict here.
+    _add_artifacts_strict_argument(artifacts_check_parser, default=True)
+
+    subparsers.add_parser(
+        "artifacts-generate",
+        help="Run each target's command to regenerate outputs, then re-snapshot.",
+    )
+
+    subparsers.add_parser(
+        "artifacts-snapshot",
+        help="Hash all configured artifact_targets and write .rrt/artifacts.lock.toml.",
+    )
+
+    changelog_subparsers = changelog_parser.add_subparsers(
+        dest="changelog_command",
+        required=True,
+    )
+    post_correct_parser = changelog_subparsers.add_parser(
+        "post-correct",
+        help="Consolidate fragmented changelog entries after a squash merge.",
+    )
+    post_correct_parser.add_argument(
+        "--squash-commit",
+        default=None,
+        metavar="SHA",
+        help="Explicit commit SHA to treat as the squash commit (defaults to HEAD).",
+    )
+    post_correct_parser.add_argument(
+        "--output",
+        default=DEFAULT_CHANGELOG,
+        metavar="PATH",
+        help="Changelog file to rewrite (default: CHANGELOG.md).",
+    )
+    post_correct_parser.add_argument(
+        "--commit",
+        action="store_true",
+        default=False,
+        help="Create a follow-up commit with the corrected changelog.",
+    )
+
+    parsed = parser.parse_args(sys.argv[1:] if argv is None else argv)
+    verbose: int = parsed.verbose
+    match parsed.command:
+        case "pre-commit":
+            return run_pre_commit(Path.cwd(), verbose=verbose)
+        case "pre-commit-changelog":
+            return run_pre_commit_changelog(
+                Path.cwd(), changelog_file=parsed.changelog_file, verbose=verbose
+            )
+        case "commit-msg":
+            return run_commit_msg(Path(parsed.message_file), verbose=verbose)
+        case "check-branch-name":
+            extra_types = load_extra_branch_types(Path.cwd())
+            return run_branch_name_check(
+                parsed.branch,
+                title="Branch name validation failed.",
+                extra_types=extra_types,
+                verbose=verbose,
+            )
+        case "check-commit-subject":
+            return run_commit_subject_check(
+                parsed.subject, title="Commit subject validation failed.", verbose=verbose
+            )
+        case "check-dirty-tree":
+            return run_dirty_tree_check(
+                Path.cwd(), title="Dirty tree validation failed.", verbose=verbose
+            )
+        case "check-docs":
+            return run_docs_check(Path.cwd(), verbose=verbose)
+        case "doctor":
+            parsed.verbose = verbose
+            return cmd_doctor(parsed)
+        case "release-check":
+            parsed.verbose = verbose
+            return cmd_release_check(parsed)
+        case "tree-check":
+            tree_args = argparse.Namespace(
+                path=None,
+                root=".",
+                max_depth=None,
+                dirs_only=False,
+                show_hidden=False,
+                inject=None,
+                anchor=None,
+                fix_empty_dirs=False,
+                dry_run=False,
+                strict_empty_dirs=False,
+                snapshot=False,
+                check=True,
+                strict=True,
+                verbose=verbose,
+                format="classic",
+            )
+            return cmd_tree(tree_args)
+        case "drift-check":
+            parsed.verbose = verbose
+            return cmd_drift_check(parsed)
+        case "sync":
+            parsed.verbose = verbose
+            return cmd_sync(parsed)
+        case "publish-snapshot":
+            parsed.verbose = verbose
+            return cmd_publish_snapshot(parsed)
+        case "config-validate":
+            return cmd_config(
+                argparse.Namespace(
+                    validate=True,
+                    schema=False,
+                    raw=False,
+                    reference=False,
+                    check=False,
+                    dry_run=False,
+                    verbose=verbose,
+                )
+            )
+        case "config-reference-check":
+            return cmd_config(
+                argparse.Namespace(
+                    reference=True,
+                    check=True,
+                    schema=False,
+                    raw=False,
+                    validate=False,
+                    dry_run=False,
+                    verbose=verbose,
+                )
+            )
+        case "changelog-lint":
+            return cmd_changelog_lint(
+                argparse.Namespace(no_fail=False, release=None, group=None, verbose=verbose)
+            )
+        case "tag-check":
+            return cmd_tag_check(
+                argparse.Namespace(strict=False, prefix="v", group=None, verbose=verbose)
+            )
+        case "check-eol":
+            parsed.verbose = verbose
+            return cmd_eol_check(parsed)
+        case "docs-generate":
+            # format/lang/root/dry-run are real argparse-parsed state now (see
+            # _add_docs_generate_arguments in register()); only docs_action is
+            # synthesized, since this flat subcommand has no nested `docs
+            # <action>` subparser to produce it naturally.
+            parsed.verbose = verbose
+            parsed.docs_action = "generate"
+            return cmd_docs(parsed)
+        case "docs-publish":
+            # check/dry-run/fail-on-change are real argparse-parsed state now
+            # (see _add_docs_publish_arguments in register()).
+            parsed.verbose = verbose
+            parsed.docs_action = "publish"
+            return cmd_docs(parsed)
+        case "docs-inject":
+            # check/root/dry-run/add-anchors are real argparse-parsed state
+            # now (see _add_docs_inject_arguments in register()).
+            parsed.verbose = verbose
+            parsed.docs_action = "inject"
+            return cmd_docs(parsed)
+        case "docs-map-update":
+            # check/root/dry-run are real argparse-parsed state now (see
+            # _add_docs_map_arguments in register()).
+            parsed.verbose = verbose
+            parsed.docs_action = "map"
+            return cmd_docs(parsed)
+        case "docs-map-check":
+            # Same shared spec as docs-map-update; register() overrides this
+            # subparser's --check default to True via set_defaults so it
+            # fails closed without exposing a second flag.
+            parsed.verbose = verbose
+            parsed.docs_action = "map"
+            return cmd_docs(parsed)
+        case "docstring-suggest":
+            parsed.verbose = verbose
+            parsed.root = "."
+            parsed.paths = []
+            parsed.min_chars = None
+            parsed.apply = True
+            return cmd_docs_suggest(parsed)
+        case "folder-check":
+            parsed.verbose = verbose
+            parsed.format = "text"
+            return cmd_folder_check(parsed)
+        case "artifacts-check":
+            # `strict` is real argparse-parsed state (see _add_artifacts_strict_argument
+            # in register()); only the fixed check-mode selection is synthesized here,
+            # since this subcommand never exposes --snapshot/--list/--regenerate.
+            parsed.verbose = verbose
+            parsed.snapshot = False
+            parsed.check = True
+            parsed.list = False
+            return cmd_artifacts(parsed)
+        case "artifacts-generate":
+            parsed.verbose = verbose
+            parsed.regenerate = True
+            parsed.snapshot = False
+            parsed.check = False
+            parsed.strict = False
+            parsed.list = False
+            parsed.dry_run = False
+            return cmd_artifacts(parsed)
+        case "artifacts-snapshot":
+            parsed.verbose = verbose
+            parsed.snapshot = True
+            parsed.check = False
+            parsed.strict = False
+            parsed.list = False
+            parsed.regenerate = False
+            return cmd_artifacts(parsed)
+        case "update-unreleased":
+            cwd = Path.cwd()
+            if parsed.message_file is not None:
+                # Explicit file path — used by lefthook which passes {1} (the commit-msg file).
+                msg_path = Path(parsed.message_file)
+                if not msg_path.exists():
+                    return emit_failure(
+                        "update-unreleased failed.",
+                        [f"Message file not found: {parsed.message_file}"],
+                    )
+                try:
+                    subject = read_commit_subject(msg_path)
+                except (OSError, UnicodeDecodeError) as exc:
+                    return emit_failure(
+                        "update-unreleased failed.",
+                        [f"Could not read message file: {exc}"],
+                    )
+            elif parsed.subject is not None:
+                subject = parsed.subject
+            else:
+                # Fall back to reading the commit message file that git sets during
+                # commit hooks. Resolve via `git rev-parse --git-dir` (not a naive
+                # cwd / ".git" join) since COMMIT_EDITMSG lives under
+                # <common-git-dir>/worktrees/<name>/ in a linked worktree, where
+                # ``.git`` is a text file rather than a directory.
+                resolved_git_dir = git.git_dir(cwd)
+                commit_editmsg = resolved_git_dir / "COMMIT_EDITMSG" if resolved_git_dir else None
+                if commit_editmsg is not None and commit_editmsg.exists():
+                    subject = read_commit_subject(commit_editmsg)
+                else:
+                    subject = ""
+            return run_update_unreleased(
+                cwd,
+                subject=subject,
+                changelog_file=parsed.changelog_file,
+                verbose=verbose,
+            )
+        case "changelog" if parsed.changelog_command == "post-correct":
+            ref = parsed.squash_commit or "HEAD"
+            return run_post_correct(
+                Path.cwd(),
+                ref=ref,
+                changelog_file=parsed.output,
+                commit=parsed.commit,
+                verbose=verbose,
+            )
+        case _:
+            return run_changelog_check(
+                parsed.subject,
+                cwd=Path.cwd(),
+                changelog_file=parsed.changelog_file,
+                changed_files=parsed.changed_files,
+                ref=parsed.ref,
+                title="Changelog validation failed.",
+                strategy=parsed.strategy,
+                branch=parsed.branch,
+                verbose=verbose,
+            )
+
+
+PRE_COMMIT_DOC = """# rrt hooks
+
+`repo-release-tools` publishes reusable hooks in `.pre-commit-hooks.yaml`.
+
+The first decision is not *which hook do I add?* — it is *which changelog
+workflow does this repo follow?*
+
+## Choose the workflow first
+
+| Workflow | Recommended hooks | Best for |
+|---|---|---|
+| `incremental` *(default)* | `rrt-branch-name`, `rrt-commit-subject`, plus `rrt-update-unreleased` **or** `rrt-changelog` | teams that maintain changelog state while developing |
+| `squash` | `rrt-branch-name`, `rrt-commit-subject`, optional `rrt-dirty-tree` / `rrt-doctor` / `rrt-release-check` | repos that squash many commits and do changelog work at release time |
+
+With `changelog_workflow = "squash"`, the changelog-writing and changelog-check
+hooks intentionally skip changelog enforcement. You can leave them configured
+during migration, but the cleaner setup is to remove them and keep only the
+non-changelog policy hooks.
+
+## Incremental workflow: keep `[Unreleased]` current
+
+```yaml
+default_install_hook_types: [pre-commit, commit-msg]
+
+repos:
+  - repo: https://github.com/Anselmoo/repo-release-tools
+    rev: v1.17.1
+    hooks:
+      - id: rrt-branch-name
+      - id: rrt-update-unreleased
+      - id: rrt-commit-subject
+```
+
+Install both hook types:
+
+```bash
+pre-commit install --hook-type pre-commit --hook-type commit-msg
+```
+
+This setup keeps `CHANGELOG.md` moving with development. `rrt-update-unreleased`
+auto-writes changelog bullets for changelog-relevant commit types, while
+`rrt-commit-subject` enforces Conventional Commits.
+
+If you prefer manual changelog edits instead of auto-writing them, replace
+`rrt-update-unreleased` with `rrt-changelog`.
+
+## Squash workflow: keep local policy, skip per-commit changelog noise
+
+```yaml
+default_install_hook_types: [pre-commit, commit-msg]
+
+repos:
+  - repo: https://github.com/Anselmoo/repo-release-tools
+    rev: v1.17.1
+    hooks:
+      - id: rrt-branch-name
+      - id: rrt-commit-subject
+```
+
+Use this when pull requests are squash-merged and you do not want ten tiny
+commit-level changelog bullets to become one giant release footnote monster.
+Pair it with:
+
+- `changelog_workflow = "squash"` in repo config
+- GitHub Action `changelog-strategy: "auto"` or `"release-only"`
+- `rrt bump` to generate release-time changelog content
+
+## Hook overview
+
+| Hook | Stage | Description |
+|---|---|---|
+| `rrt-branch-name` | pre-commit | Validate branch naming convention |
+| `rrt-update-unreleased` | commit-msg | Auto-write a bullet under `[Unreleased]` for changelog-relevant commits |
+| `rrt-changelog` | pre-commit | Require a staged changelog update for changelog-relevant work |
+| `rrt-commit-subject` | commit-msg | Validate Conventional Commit subjects |
+| `rrt-dirty-tree` | pre-push / manual | Fail on uncommitted changes |
+| `rrt-doctor` | manual | Run `rrt doctor` core automation checks on `rrt` config |
+| `rrt-release-check` | manual | Run `rrt release check` for version targets, pin targets, and changelog files |
+| `rrt-docs-lock` | manual | Regenerate the source-owned docs lockfile (`.rrt/docs.lock.toml`) |
+| `rrt-docs-publish` | manual | Regenerate CLI reference documentation and topic pages |
+| `rrt-docs-inject` | manual | Synchronize shared anchor blocks across documentation |
+| `rrt-docstring-suggest` | manual | Apply scaffolded docstrings to missing or thin module docstrings |
+| `rrt-folder-check` | pre-commit / pre-push | Validate repository folder structure against `[tool.rrt.folders]` config |
+| `rrt-artifacts-generate` | pre-commit | Run generation commands and snapshot hashes to `.rrt/artifacts.lock.toml` |
+| `rrt-artifacts-check` | manual | Verify artifact hashes match the committed lock (strict by default) |
+| `rrt-artifacts-snapshot` | manual | Snapshot artifact hashes without running generation commands |
+| `rrt-tree-check` | pre-push | Validate project tree structure against the committed `.rrt/tree.lock.toml` |
+| `rrt-drift-check` | pre-push | Verify agent-facing surfaces match the committed `.rrt/drift.lock.toml` |
+| `rrt-changelog-postcorrect` | manual | Consolidate fragmented changelog entries after a squash merge |
+| `rrt-sync` | manual | List upstream releases newer than the current version |
+| `rrt-config-validate` | pre-commit / pre-push | Validate `[tool.rrt]` config — version targets, pin targets, and structure |
+| `rrt-config-reference-check` | manual | Fail when `docs/rrt-config-reference.toml` is stale vs the schema |
+| `rrt-changelog-lint` | pre-commit | Enforce changelog entry style (sentence case, length, no duplicates) |
+| `rrt-tag-check` | pre-push | Validate existing git tags follow the configured naming convention |
+
+`rrt-update-unreleased` and `rrt-changelog` are alternatives for the
+incremental workflow. You usually want one or the other, not both.
+
+## Optional guards
+
+### Dirty tree check
+
+`rrt-dirty-tree` is not enabled in the minimal configs because a normal
+`pre-commit` run happens while the working tree is intentionally dirty. It is
+better suited for `pre-push` or manual execution when you want to enforce a
+clean repository before publishing work:
+
+```yaml
+repos:
+  - repo: https://github.com/Anselmoo/repo-release-tools
+    rev: v1.17.1
+    hooks:
+      - id: rrt-dirty-tree
+        stages: [pre-push]
+```
+
+### Doctor check
+
+`rrt-doctor` runs `rrt doctor` against the repository's core automation wiring
+so you can confirm hook and CI surfaces are configured before a release or
+automation rollout:
+
+```bash
+pre-commit run rrt-doctor --hook-stage manual
+# or directly:
+rrt doctor
+```
+
+### Release check
+
+`rrt-release-check` runs `rrt release check` against version targets, pin
+targets, and changelog files in `[tool.rrt]`. It is also registered at the
+`manual` stage so you can invoke it on demand before releases:
+
+```bash
+pre-commit run rrt-release-check --hook-stage manual
+# or directly:
+rrt release check
+```
+
+You can also run the same dirty-tree logic directly:
+
+```bash
+rrt-hooks check-dirty-tree
+```
+
+### Tree check
+
+`rrt-tree-check` validates the project directory structure against the
+committed `.rrt/tree.lock.toml`. Run it at `pre-push` to catch accidental
+layout changes before they reach the remote:
+
+```yaml
+repos:
+  - repo: https://github.com/Anselmoo/repo-release-tools
+    rev: v1.17.1
+    hooks:
+      - id: rrt-tree-check
+        stages: [pre-push]
+```
+
+Generate or refresh the lock with `rrt tree --lock`.
+
+### Drift check
+
+`rrt-drift-check` verifies that agent-facing surfaces (MCP tool definitions,
+skills, and related metadata) match the committed `.rrt/drift.lock.toml`.
+Pair it with `pre-push` to prevent publishing stale agent interfaces:
+
+```yaml
+repos:
+  - repo: https://github.com/Anselmoo/repo-release-tools
+    rev: v1.17.1
+    hooks:
+      - id: rrt-drift-check
+        stages: [pre-push]
+```
+
+Update the lock with `rrt drift snapshot`.
+
+### Upstream sync
+
+`rrt-sync` lists upstream releases that are strictly newer than the current
+project version. It is a read-only informational hook registered at the
+`manual` stage — useful in release pipelines to decide whether a bump is
+needed:
+
+```bash
+# List newer versions one per line
+pre-commit run rrt-sync --hook-stage manual
+# or directly:
+rrt sync
+rrt sync --json
+```
+
+See `[tool.rrt.upstream]` config and the `rrt sync` command for details.
+
+### Config reference & validation
+
+`rrt-config-validate` gates commits and pushes by validating the `[tool.rrt]`
+config — checking that version targets resolve, pin targets reference known
+files, and the overall structure is well-formed. `docs/rrt-config-reference.toml`
+is schema-generated; `rrt-config-reference-check` (manual stage) fails the hook
+run when the file is stale relative to the current schema. (Regenerating and
+staging that file on each commit is repo self-tooling — wire a local
+`bash -c 'rrt config --reference --check || (rrt config --reference && git add …)'`
+hook in your own `.pre-commit-config.yaml` if you vendor the reference.)
+
+### Changelog lint
+
+`rrt-changelog-lint` enforces changelog entry style on every `pre-commit` run —
+requiring sentence case, capping entry length, and rejecting duplicate bullets
+before they accumulate.
+
+### Tag check
+
+`rrt-tag-check` runs at `pre-push` and validates that existing git tags in the
+repository follow the naming convention configured under `[tool.rrt]`.
+
+## Post-correction mode (squash-merge workflows)
+
+When a pull request is merged via **squash merge**, GitHub condenses all
+per-commit changelog entries into the squash commit. The result can be
+fragmented micro-commit noise in `CHANGELOG.md` — for example several
+`"CI: add Node 26"` / `"CI: remove Node 26"` pairs that cancel each other out.
+
+`rrt-hooks changelog post-correct` consolidates those entries by:
+
+1. Inspecting the diff that the squash commit introduced to `CHANGELOG.md`.
+2. Removing **exact duplicate** bullet entries (case-insensitive).
+3. Removing **semantically-cancelling pairs** — e.g. `"CI: add Node 26"` followed by
+   `"CI: remove Node 26"`, or bare `"add X"` / `"remove X"`.  Scope prefixes
+   (e.g. `CI:`, `Deps:`) must match for entries to be considered a pair.
+4. Rewriting `CHANGELOG.md` in-place with the cleaned content, restricting
+   removals to the exact diff hunk so older release sections are never touched.
+5. Optionally creating a follow-up commit (`--commit`).
+
+### Quick usage
+
+```bash
+# auto mode — use HEAD as the squash commit (default when no SHA given)
+rrt-hooks changelog post-correct
+
+# explicit squash commit SHA
+rrt-hooks changelog post-correct --squash-commit abc1234
+
+# write a follow-up commit automatically
+rrt-hooks changelog post-correct --commit
+```
+
+### As a GitHub Actions step (post-merge on default branch)
+
+```yaml
+- name: Consolidate changelog after squash merge
+  if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+  run: uvx --from repo-release-tools rrt-hooks changelog post-correct --commit
+```
+
+### Options
+
+| Flag | Description |
+|---|---|
+| `--squash-commit SHA` | Explicit commit SHA to inspect (defaults to `HEAD`) |
+| `--output PATH` | Changelog file to rewrite (default: `CHANGELOG.md`) |
+| `--commit` | Create a follow-up commit with the corrected changelog |
+
+---
+
+## Lefthook setup
+
+[Lefthook](https://github.com/evilmartians/lefthook) can run the same local
+policy with an installed `rrt-hooks` binary.
+
+Install `repo-release-tools` so `rrt-hooks` is on `PATH`, then add the commands
+that match your workflow.
+
+### Incremental workflow example
+
+```yaml
+# lefthook.yml
+commit-msg:
+  commands:
+    rrt-update-unreleased:
+      run: rrt-hooks update-unreleased --message-file {1}
+    rrt-commit-subject:
+      run: rrt-hooks commit-msg {1}
+
+pre-commit:
+  commands:
+    rrt-branch-name:
+      run: rrt-hooks pre-commit
+
+pre-push:
+  commands:
+    rrt-changelog:
+      run: rrt-hooks check-changelog --subject "$(git log -1 --format=%s)" --strategy unreleased
+```
+
+### Squash workflow example
+
+```yaml
+# lefthook.yml
+commit-msg:
+  commands:
+    rrt-commit-subject:
+      run: rrt-hooks commit-msg {1}
+
+pre-commit:
+  commands:
+    rrt-branch-name:
+      run: rrt-hooks pre-commit
+```
+
+---
+
+## Husky setup
+
+[Husky](https://github.com/typicode/husky) v9 runs shell scripts from `.husky/`
+and works with any installed CLI, including `rrt-hooks`.
+
+Install `repo-release-tools` so `rrt-hooks` is on `PATH`, then initialise Husky
+once and add the script files that match your workflow:
+
+```bash
+pip install repo-release-tools   # or: uv pip install repo-release-tools
+npx husky init
+```
+
+> **Husky v9 hook file format**: `npx husky init` creates `.husky/pre-commit` with
+> a shell shebang. Keep the header it generates and replace only the command body.
+> Each hook file must be executable — run `chmod +x .husky/<hook>` after creating it.
+
+### Incremental workflow example
+
+```sh
+#!/usr/bin/env sh
+# .husky/pre-commit
+rrt-hooks pre-commit
+```
+
+```sh
+#!/usr/bin/env sh
+# .husky/commit-msg
+rrt-hooks update-unreleased --message-file "$1"
+rrt-hooks commit-msg "$1"
+```
+
+```sh
+#!/usr/bin/env sh
+# .husky/pre-push  (optional — add when you want an unreleased guard)
+rrt-hooks check-changelog --subject "$(git log -1 --format=%s)" --strategy unreleased
+```
+
+After creating each file, make it executable:
+
+```bash
+chmod +x .husky/pre-commit .husky/commit-msg  # add .husky/pre-push if used
+```
+
+### Squash workflow example
+
+```sh
+#!/usr/bin/env sh
+# .husky/pre-commit
+rrt-hooks pre-commit
+```
+
+```sh
+#!/usr/bin/env sh
+# .husky/commit-msg
+rrt-hooks commit-msg "$1"
+```
+
+### Comparison: pre-commit · lefthook · husky
+
+| Policy | pre-commit | lefthook | husky |
+|---|---|---|---|
+| Auto-write changelog | `rrt-update-unreleased` (commit-msg) | `rrt-update-unreleased --message-file {1}` | `rrt-hooks update-unreleased --message-file "$1"` |
+| Validate commit subject | `rrt-commit-subject` (commit-msg) | `rrt-commit-subject {1}` | `rrt-hooks commit-msg "$1"` |
+| Validate branch name | `rrt-branch-name` (pre-commit) | `rrt-hooks pre-commit` | `rrt-hooks pre-commit` |
+| Pre-push unreleased guard | `rrt-changelog` or `rrt-dirty-tree` | `rrt-hooks check-changelog --subject "$(git log -1 --format=%s)" --strategy unreleased` | `rrt-hooks check-changelog --subject "$(git log -1 --format=%s)" --strategy unreleased` |
+"""
+
+AGENT_INSTRUCTIONS_DOC = """# Hook & Action Reference
+
+*Static context for agents: read this before using any prompt block below.*
+
+## Agent context
+
+**Repo:** [github.com/Anselmoo/repo-release-tools](https://github.com/Anselmoo/repo-release-tools) · Python ≥ 3.12 · `uv_build`
+
+**Entry points** (from `pyproject.toml`):
+- `rrt-hooks` → `repo_release_tools.workflow.hooks:main` — git hook runner (installed binary, NOT a uvx shortcut)
+- `rrt` → `repo_release_tools.cli:app` — developer CLI
+
+**Key files:**
+| File | Role |
+|---|---|
+| `src/repo_release_tools/hooks.py` | All `rrt-hooks` subcommand logic |
+| `src/repo_release_tools/changelog.py` | Changelog parsing, `[Unreleased]` management |
+| `.pre-commit-hooks.yaml` | Hook definitions consumed by pre-commit |
+| `lefthook.yml` | Lefthook configuration (repo root) |
+| `action.yml` | Composite GitHub Action |
+
+**Verification commands:**
+```bash
+uv run pytest tests/test_hooks.py -x -q   # fast unit tests
+uvx pre-commit run --all-files             # lint (ruff, line-length 100)
+```
+
+**Assumptions:** `pre-commit`, `lefthook`, and `uv` are already installed. Do not recommend `brew install`, `pip install pre-commit`, or `apt install` for these tools.
+
+---
+
+## pre-commit / lefthook
+
+### Activate pre-commit hooks
+
+> Use the following prompt to activate pre-commit hooks for repo-release-tools.
+
+````prompt
+<context>
+Repo: https://github.com/Anselmoo/repo-release-tools
+Entry point: rrt-hooks (installed binary — repo_release_tools.workflow.hooks:main)
+Python ≥ 3.12 | uv_build | Conventional Commits | Keep-a-Changelog
+Assume pre-commit is already installed.
+</context>
+
+Activate the pre-commit hooks for this repository. A `.pre-commit-config.yaml` must exist (see prompt below). Then run:
+
+```bash
+pre-commit install --install-hooks
+```
+
+This installs hooks for every stage declared in `default_install_hook_types`. Commit-msg-stage hooks require `commit-msg` in that list — omitting it silently skips `rrt-update-unreleased` and `rrt-commit-subject`.
+````
+
+### Activate lefthook hooks
+
+> Use the following prompt to activate lefthook hooks for repo-release-tools.
+
+````prompt
+<context>
+Repo: https://github.com/Anselmoo/repo-release-tools
+Entry point: rrt-hooks (installed binary — repo_release_tools.workflow.hooks:main)
+Python ≥ 3.12 | uv_build | Conventional Commits | Keep-a-Changelog
+Assume lefthook and uv are already installed.
+</context>
+
+Activate lefthook hooks. A `lefthook.yml` must exist at the repo root (see prompt below). Then run:
+
+```bash
+uv tool install repo-release-tools   # installs rrt-hooks binary
+lefthook install                      # registers git hooks
+```
+
+DO NOT use `uvx --from repo-release-tools rrt-hooks …` in `lefthook.yml` — `rrt-hooks` is an installed binary, not a uvx shortcut.
+````
+
+### .pre-commit-config.yaml — incremental workflow (auto-write changelog)
+
+> Use the following prompt to configure pre-commit with auto-write changelog.
+
+````prompt
+<context>
+Repo: https://github.com/Anselmoo/repo-release-tools
+Entry point: rrt-hooks (installed binary — repo_release_tools.workflow.hooks:main)
+Python ≥ 3.12 | uv_build | Conventional Commits | Keep-a-Changelog
+Assume pre-commit is already installed.
+</context>
+
+Create `.pre-commit-config.yaml` at the repo root with this content:
+
+```yaml
+default_install_hook_types: [pre-commit, commit-msg]
+
+repos:
+  - repo: https://github.com/Anselmoo/repo-release-tools
+    rev: v1.17.1
+    hooks:
+      - id: rrt-branch-name
+      - id: rrt-update-unreleased
+      - id: rrt-commit-subject
+```
+````
+"""
+
+# Ordered source-owned topic docs for docs generation.
+SOURCE_OWNED_TOPIC_DOCS: tuple[tuple[str, str], ...] = (
+    ("hooks", PRE_COMMIT_DOC),
+    ("agent-instructions", AGENT_INSTRUCTIONS_DOC),
+)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

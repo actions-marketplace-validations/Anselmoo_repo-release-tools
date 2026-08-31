@@ -1,6 +1,6 @@
 [project]
 name = "repo-release-tools"
-version = "0.1.7"
+version = "1.17.1"
 description = "Config-driven branch and release helpers for Git repositories"
 readme = "README.md"
 license = "MIT"
@@ -9,11 +9,10 @@ authors = [{ name = "Anselm Hahn" }]
 requires-python = ">=3.12"
 keywords = ["git", "release", "branch", "versioning", "cli"]
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 5 - Production/Stable",
     "Environment :: Console",
     "Intended Audience :: Developers",
     "Operating System :: OS Independent",
-    "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3 :: Only",
     "Programming Language :: Python :: 3.12",
@@ -26,33 +25,572 @@ classifiers = [
 dependencies = []
 
 [project.urls]
-Homepage = "https://github.com/Anselmoo/repo-release-tools"
+Homepage = "https://anselmoo.github.io/repo-release-tools/"
 Issues = "https://github.com/Anselmoo/repo-release-tools/issues"
 Source = "https://github.com/Anselmoo/repo-release-tools"
 
 [project.scripts]
 repo-release-tools = "repo_release_tools.cli:main"
 rrt = "repo_release_tools.cli:main"
-rrt-hooks = "repo_release_tools.hooks:main"
+rrt-agents = "repo_release_tools.commands.agents_cmd:main"
+rrt-hooks = "repo_release_tools.workflow.hooks:main"
+rrt-mcp = "repo_release_tools.mcp.server:main"
+
+[project.optional-dependencies]
+mcp = ["fastmcp[apps]>=3.3.0"]
 
 [build-system]
-requires = ["uv_build>=0.9.26,<0.12.0"]
+requires = ["uv_build>=0.9.26,<0.13.0"]
 build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-root = "src"
+source-include = [
+    ".github/agents/**",
+    ".github/hooks/**",
+    ".github/skills/**",
+    "src/repo_release_tools/assets/**",
+    "src/repo_release_tools/_data/**",
+]
+
+[tool.uv.build-backend.data]
+purelib = ".github/skills"
+data = ".github/agents"
+headers = ".github/hooks"
+
 
 [dependency-groups]
 dev = [
+    "fastmcp[apps]>=3.3.0",
+    "pillow>=11.0",
+    "poethepoet>=0.45.0",
     "pytest>=8.0",
     "pytest-cov>=7.1.0",
     "ruff>=0.14.0",
     "ty>=0.0.26",
+    "libcst>=0.4.0",
 ]
+
+[tool.poe.groups.docs]
+heading = "Documentation"
+
+[tool.poe.groups.docs.tasks.docs-generate]
+help = "Regenerate the CLI reference and topic docs from source."
+cmd = "rrt docs publish"
+
+[tool.poe.groups.docs.tasks.docs-inject]
+help = "Inject shared anchor blocks (headers/footers) into doc files."
+cmd = "rrt docs inject --add-anchors"
+
+[tool.poe.groups.docs.tasks.docs-inject-check]
+help = "Verify all shared anchor blocks are up to date."
+cmd = "rrt docs inject --check"
+
+[tool.poe.groups.docs.tasks.docs-check]
+help = "Verify all generated docs match their source-owned content."
+cmd = "rrt docs publish --check"
+
+[tool.poe.groups.docs.tasks.docs-toc]
+help = "Inject auto-generated TOC into all doc pages that carry a toc anchor."
+shell = """
+for f in docs/commands/*.md; do
+  uv run rrt toc "$f" --inject "$f" --anchor toc --min-level 2 --max-level 3 2>/dev/null || true
+done
+"""
+
+[tool.poe.groups.docs.tasks.docs]
+help = "Regenerate generated docs and confirm they are current."
+sequence = [
+    "docs-generate",
+    "docs-check",
+    "docs-inject",
+    "docs-inject-check",
+    "docs-toc",
+    "badge-export",
+    "badge-sync",
+    "banner-export",
+]
+
+[tool.poe.groups.docs.tasks.docs-verify]
+help = "Verify generated docs and shared anchors are current."
+sequence = ["docs-generate", "docs-check", "docs-inject-check"]
+
+[tool.poe.groups.docs.tasks.serve]
+help = "Generate badge assets, then serve the docs site locally with Astro's dev server at http://localhost:4321/."
+sequence = ["badge-export", "badge-sync", "serve-run"]
+
+[tool.poe.groups.docs.tasks.serve-run]
+help = "Start Astro's dev server (assumes badge assets already exist; use 'serve' otherwise)."
+shell = "cd docs && npm ci && npm run dev"
+
+[tool.poe.groups.docs.tasks.preview]
+help = "Generate badge assets, then build and serve the production build (base-aware, via astro preview) to simulate GitHub Pages exactly."
+sequence = ["badge-export", "badge-sync", "preview-run"]
+
+[tool.poe.groups.docs.tasks.preview-run]
+help = "Build and serve the production build (assumes badge assets already exist; use 'preview' otherwise)."
+shell = "cd docs && npm run build && npm run preview"
+
+[tool.poe.groups.docs.tasks.sync-assets]
+help = "Validate source-owned skill and agent assets are present (no copy needed)."
+cmd = "python -c \"from pathlib import Path; req=[Path('.github/skills/rrt-user-bootstrap/SKILL.md'), Path('.github/skills/rrt-user-versioning/SKILL.md'), Path('.github/skills/rrt-user-release-flow/SKILL.md'), Path('.github/skills/rrt-user-branch-strategy/SKILL.md'), Path('.github/skills/rrt-user-commit-quality/SKILL.md'), Path('.github/skills/rrt-user-changelog-automation/SKILL.md'), Path('.github/skills/rrt-user-docs-consistency/SKILL.md'), Path('.github/skills/rrt-user-config-safety/SKILL.md'), Path('.github/skills/rrt-user-ci-readiness/SKILL.md'), Path('.github/skills/rrt-user-migration-uvx-to-installed/SKILL.md'), Path('.github/agents/rrt-user-bootstrap.agent.md'), Path('.github/agents/rrt-user-version-planner.agent.md'), Path('.github/agents/rrt-user-release-readiness.agent.md'), Path('.github/agents/rrt-user-branch-guard.agent.md'), Path('.github/agents/rrt-user-commit-lint-triage.agent.md'), Path('.github/agents/rrt-user-changelog-curator.agent.md'), Path('.github/agents/rrt-user-config-validator.agent.md'), Path('.github/agents/rrt-user-docs-sync-auditor.agent.md'), Path('.github/agents/rrt-user-ci-failure-triage.agent.md'), Path('.github/agents/rrt-user-upgrade-assistant.agent.md'), Path('.github/hooks/rrt_user_branch_policy.py'), Path('.github/hooks/rrt_user_commit_policy.py'), Path('.github/hooks/rrt_user_changelog_policy.py'), Path('.github/hooks/rrt_user_release_readiness.py'), Path('.github/hooks/rrt_user_config_sanity.py'), Path('.github/hooks/rrt_user_docs_sync_hint.py'), Path('.github/hooks/rrt_user_dirty_tree_guard.py'), Path('.github/hooks/rrt_user_version_drift_guard.py'), Path('.github/hooks/rrt_user_ci_local_preflight.py'), Path('.github/hooks/rrt_user_security_hygiene_hint.py')]; missing=[str(p) for p in req if not p.exists()]; print('source-owned assets verified' if not missing else 'missing assets: '+', '.join(missing)); raise SystemExit(0 if not missing else 1)\""
+
+[tool.poe.groups.docs.tasks.banner-export]
+help = "Render all theme/platform banner PNGs to docs/assets/ (banner-dark.png, banner-light.png, banner-windows.png, social-card.png)."
+cmd = "python -m repo_release_tools.assets.banner docs/assets"
+
+[tool.poe.groups.docs.tasks.badge-export]
+help = "Export all platform/variant badge SVGs to src/repo_release_tools/assets/badges/ for shipping."
+cmd = "python -m repo_release_tools.assets.badges src/repo_release_tools/assets/badges"
+
+[tool.poe.groups.docs.tasks.badge-sync]
+help = "Sync already-generated src/badges SVGs to docs/public/assets/badges/ (run after badge-export)."
+cmd = "python -m repo_release_tools.assets.badges docs/public/assets/badges"
+
+[tool.rrt]
+pin_target_missing = "warn"
+
+[[tool.rrt.generated_assets]]
+path = "docs/assets/banner-dark.png"
+command = [
+    "uv",
+    "run",
+    "python",
+    "-m",
+    "repo_release_tools.assets.banner",
+    "docs/assets/banner-dark.png",
+    "unicode",
+]
+
+[[tool.rrt.generated_assets]]
+path = "docs/assets/banner-light.png"
+command = [
+    "uv",
+    "run",
+    "python",
+    "-m",
+    "repo_release_tools.assets.banner",
+    "docs/assets/banner-light.png",
+    "light",
+]
+
+[[tool.rrt.generated_assets]]
+path = "docs/assets/banner-windows.png"
+command = [
+    "uv",
+    "run",
+    "python",
+    "-m",
+    "repo_release_tools.assets.banner",
+    "docs/assets/banner-windows.png",
+    "ascii",
+]
+
+[[tool.rrt.generated_assets]]
+path = "docs/assets/social-card.png"
+command = [
+    "uv",
+    "run",
+    "python",
+    "-m",
+    "repo_release_tools.assets.banner",
+    "docs/assets/social-card.png",
+    "social",
+]
+
+[[tool.rrt.artifact_targets]]
+path = "src/repo_release_tools/assets/badges/*.svg"
+description = "Platform badge SVG files"
+
+[[tool.rrt.version_targets]]
+path = "pyproject.toml"
+kind = "pep621"
+
+[[tool.rrt.version_targets]]
+path = "src/repo_release_tools/__init__.py"
+kind = "python_version"
+
+[[tool.rrt.version_targets]]
+path = "docs/package.json"
+kind = "package_json"
+
+[[tool.rrt.version_targets]]
+path = "server.json"
+kind = "mcp_server_json"
+
+[[tool.rrt.pin_targets]]
+path = "README.md"
+pattern = '(Anselmoo/repo-release-tools(?:/[\w.-]+)*@v)(\d+\.\d+\.\d+)()'
+
+[[tool.rrt.pin_targets]]
+path = "src/repo_release_tools/workflow/hooks.py"
+pattern = '(Anselmoo/repo-release-tools(?:/[\w.-]+)*@v|rev: v)(\d+\.\d+\.\d+)()'
+
+[[tool.rrt.pin_targets]]
+path = "src/repo_release_tools/integrations/action.py"
+pattern = '(Anselmoo/repo-release-tools(?:/[\w.-]+)*@v|rev: v)(\d+\.\d+\.\d+)()'
+
+[[tool.rrt.pin_targets]]
+path = "src/repo_release_tools/integrations/skill_assets.py"
+pattern = '(Anselmoo/repo-release-tools(?:/[\w.-]+)*@v|rev: v)(\d+\.\d+\.\d+)()'
+
+[[tool.rrt.pin_targets]]
+path = ".github/skills/**/SKILL.md"
+pattern = '(Anselmoo/repo-release-tools(?:/[\w.-]+)*@v|rev: v)(\d+\.\d+\.\d+)()'
+
+[tool.rrt.folders]
+
+[[tool.rrt.folders.templates]]
+name = "tests-root"
+description = "tests/ root: only conftest.py plus the ten logical subdirs"
+strictness = "strict"
+exact = false
+required_files = ["conftest.py"]
+required_dirs = [
+    "commands",
+    "core",
+    "docs",
+    "eol",
+    "folders",
+    "integration",
+    "mcp",
+    "ui",
+    "version",
+    "workflow",
+]
+
+[[tool.rrt.folders.templates]]
+name = "tests-commands"
+description = "One test file per rrt subcommand"
+strictness = "loose"
+exact = false
+required_files = [
+    "test_agents_cmd.py",
+    "test_artifacts_cmd.py",
+    "test_branch.py",
+    "test_bump.py",
+    "test_ci_version.py",
+    "test_config_cmd.py",
+    "test_docs_cmd.py",
+    "test_doctor.py",
+    "test_env_cmd.py",
+    "test_eol_check.py",
+    "test_folder_cmd.py",
+    "test_folder_cmd_extra.py",
+    "test_git_cmd.py",
+    "test_hooks_cmd.py",
+    "test_init.py",
+    "test_release_cmd.py",
+    "test_skill.py",
+    "test_toc.py",
+    "test_tree.py",
+]
+
+[[tool.rrt.folders.templates]]
+name = "tests-core"
+description = "Root-level module tests: changelog, cli, config loading, state"
+strictness = "strict"
+exact = false
+required_files = [
+    "test_changelog.py",
+    "test_cli.py",
+    "test_config.py",
+    "test_state.py",
+]
+
+[[tool.rrt.folders.templates]]
+name = "tests-docs"
+description = "Docs subsystem tests"
+strictness = "strict"
+exact = false
+required_files = [
+    "test_docs_extractor.py",
+    "test_docs_formats.py",
+    "test_generate_cli_docs.py",
+    "test_markdown_utils.py",
+]
+
+[[tool.rrt.folders.templates]]
+name = "tests-eol"
+description = "End-of-life module tests"
+strictness = "loose"
+exact = false
+required_files = ["test_eol.py"]
+
+[[tool.rrt.folders.templates]]
+name = "tests-folders"
+description = "Folders module tests"
+strictness = "strict"
+exact = false
+required_files = ["test_folders_config_extra.py", "test_folders_core_extra.py"]
+
+[[tool.rrt.folders.templates]]
+name = "tests-integration"
+description = "Real-subprocess e2e tests (@pytest.mark.runtime)"
+strictness = "loose"
+exact = false
+required_files = ["test_runtime_hybrid.py"]
+
+[[tool.rrt.folders.templates]]
+name = "tests-mcp"
+description = "MCP server tests"
+strictness = "strict"
+exact = false
+required_files = [
+    "conftest.py",
+    "test_apps.py",
+    "test_models.py",
+    "test_prompts.py",
+    "test_resources.py",
+    "test_server.py",
+    "test_tools.py",
+]
+
+[[tool.rrt.folders.templates]]
+name = "tests-ui"
+description = "UI rendering layer tests"
+strictness = "strict"
+exact = false
+required_files = [
+    "test_glyphs.py",
+    "test_output.py",
+    "test_syntax_extra.py",
+    "test_ui_color.py",
+    "test_ui_font.py",
+    "test_ui_init.py",
+    "test_ui_layout.py",
+    "test_ui_messaging.py",
+    "test_ui_progress.py",
+    "test_ui_prompt.py",
+    "test_ui_syntax.py",
+    "test_user_experience_simulator.py",
+]
+
+[[tool.rrt.folders.templates]]
+name = "tests-version"
+description = "Versioning module tests"
+strictness = "strict"
+exact = false
+required_files = ["test_calver.py", "test_version_targets.py", "test_versioning.py"]
+
+[[tool.rrt.folders.templates]]
+name = "tests-workflow"
+description = "Workflow / low-level git helper tests"
+strictness = "loose"
+exact = false
+required_files = ["test_git_helpers.py"]
+
+[[tool.rrt.folders.rules]]
+name = "tests-root-rule"
+selector = "tests"
+templates = ["tests-root"]
+
+[[tool.rrt.folders.rules]]
+name = "tests-commands-rule"
+selector = "tests/commands"
+templates = ["tests-commands"]
+
+[[tool.rrt.folders.rules]]
+name = "tests-core-rule"
+selector = "tests/core"
+templates = ["tests-core"]
+
+[[tool.rrt.folders.rules]]
+name = "tests-docs-rule"
+selector = "tests/docs"
+templates = ["tests-docs"]
+
+[[tool.rrt.folders.rules]]
+name = "tests-eol-rule"
+selector = "tests/eol"
+templates = ["tests-eol"]
+
+[[tool.rrt.folders.rules]]
+name = "tests-folders-rule"
+selector = "tests/folders"
+templates = ["tests-folders"]
+
+[[tool.rrt.folders.rules]]
+name = "tests-integration-rule"
+selector = "tests/integration"
+templates = ["tests-integration"]
+
+[[tool.rrt.folders.rules]]
+name = "tests-mcp-rule"
+selector = "tests/mcp"
+templates = ["tests-mcp"]
+
+[[tool.rrt.folders.rules]]
+name = "tests-ui-rule"
+selector = "tests/ui"
+templates = ["tests-ui"]
+
+[[tool.rrt.folders.rules]]
+name = "tests-version-rule"
+selector = "tests/version"
+templates = ["tests-version"]
+
+[[tool.rrt.folders.rules]]
+name = "tests-workflow-rule"
+selector = "tests/workflow"
+templates = ["tests-workflow"]
+
+[tool.rrt.eol]
+languages = ["python"]
+warn_days = 180
+error_days = 0
+
+[tool.rrt.docs]
+mirror_src_tree = true
+docs_dir = "docs"
+src_dir = "src/repo_release_tools"
+suggest_roots = ["src/repo_release_tools/commands"]
+suggest_exempt = ["__init__.py", "__main__.py"]
+suggest_min_chars = 2500
+badge_variant = "adaptive"
+# Must exactly match docs/astro.config.mjs's `base:` value.
+base_url = "/repo-release-tools"
+
+# Source-link settings used by docs exporters to build file/line URLs.
+source_repo_url = "https://github.com/Anselmoo/repo-release-tools"
+source_ref = "main"
+source_url_template = "{repo_url}/blob/{ref}/{path}#L{line}"
+stubs = [
+    "commands/bump",
+    "commands/ci_version",
+    "commands/config_cmd",
+    "commands/env_cmd",
+    "commands/init",
+]
+
+[[tool.rrt.docs.shared_blocks]]
+anchor_id = "page-header"
+content = """{platform_badge_adaptive_reto}
+"""
+before_blank_lines = 0
+after_blank_lines = 1
+targets = [
+    "docs/commands/*.md",
+]
+
+[[tool.rrt.docs.shared_blocks]]
+anchor_id = "readme-header"
+content = """<p><a href="{repo_url}"><picture>
+  <source media="(prefers-color-scheme: dark)" srcset="{repo_url}/blob/main/docs/assets/readme-badges/github-reto-dark.svg?raw=true">
+  <source media="(prefers-color-scheme: light)" srcset="{repo_url}/blob/main/docs/assets/readme-badges/github-reto-light.svg?raw=true">
+  <img alt="GitHub" src="{repo_url}/blob/main/docs/assets/readme-badges/github-reto-dark.svg?raw=true">
+</picture></a> <a href="https://pypi.org/project/repo-release-tools/"><picture>
+  <source media="(prefers-color-scheme: dark)" srcset="{repo_url}/blob/main/docs/assets/readme-badges/pypi-reto-dark.svg?raw=true">
+  <source media="(prefers-color-scheme: light)" srcset="{repo_url}/blob/main/docs/assets/readme-badges/pypi-reto-light.svg?raw=true">
+  <img alt="PyPI" src="{repo_url}/blob/main/docs/assets/readme-badges/pypi-reto-dark.svg?raw=true">
+</picture></a></p>
+"""
+before_blank_lines = 0
+after_blank_lines = 1
+targets = ["README.md"]
+
+[[tool.rrt.docs.shared_blocks]]
+anchor_id = "readme-banner"
+content = """<p><a href="{repo_url}"><picture>
+  <source media="(prefers-color-scheme: dark)" srcset="{repo_url}/blob/main/docs/assets/banner-dark.png?raw=true">
+  <source media="(prefers-color-scheme: light)" srcset="{repo_url}/blob/main/docs/assets/banner-light.png?raw=true">
+  <img alt="REPO-RELEASE-TOOLS pipeline banner" src="{repo_url}/blob/main/docs/assets/banner-dark.png?raw=true">
+</picture></a></p>
+"""
+before_blank_lines = 0
+after_blank_lines = 1
+targets = ["README.md"]
+
+[[tool.rrt.docs.shared_blocks]]
+anchor_id = "doc-footer"
+position = "append"
+content = """
+---
+
+[↑ Docs index](https://anselmoo.github.io/repo-release-tools/) · [CLI reference](https://github.com/Anselmoo/repo-release-tools/blob/main/docs/commands/rrt-cli.md) · [Changelog](https://github.com/Anselmoo/repo-release-tools/blob/main/CHANGELOG.md) · [GitHub]({repo_url})
+"""
+before_blank_lines = 1
+after_blank_lines = 0
+targets = [
+    "docs/commands/*.md",
+]
+
+[[tool.rrt.eol.overrides]]
+language = "python"
+cycle = "3.12"
+eol = "2026-12-31"
 
 [tool.ruff]
 line-length = 100
 target-version = "py312"
+output-format = "full"
+
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "ANN", "D"]
+# D203 (one-blank-line-before-class) conflicts with D211 (no-blank-line-before-class)
+# D213 (multi-line-summary-second-line) conflicts with D212 (multi-line-summary-first-line)
+# ANN401 disallows 'Any' but we legitimately use it in UI/hook APIs
+ignore = ["D203", "D213", "ANN401", "E501"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.per-file-ignores]
+# Test files: no docstring rules; allow assert and private member access
+"tests/**/*.py" = ["D"]
+
+[tool.ty.environment]
+python-version = "3.12"
+extra-paths = ["src"]
+
+[tool.ty.src]
+include = ["src", "tests"]
+exclude = ["src/repo_release_tools/mcp"]
+
+[tool.ty.terminal]
+output-format = "full"
+
+[tool.ty.rules]
+possibly-unresolved-reference = "error"
+unresolved-import = "error"
+missing-argument = "error"
+invalid-return-type = "error"
+unused-ignore-comment = "warn"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+addopts = [
+    "--cov=src/repo_release_tools",
+    "--cov-report=xml",
+    "--cov-report=term-missing",
+    "--cov-fail-under=100",
+]
 markers = [
     "runtime: end-to-end runtime/toolchain integration tests",
+    "mcp: tests requiring the [mcp] optional extra (fastmcp, prefab_ui)",
+    "e2e: behavior-contract characterization tests (subprocess surfaces; run alone with --no-cov)",
 ]
+
+[tool.coverage.run]
+source = ["src/repo_release_tools"]
+omit = ["tests/*", "src/repo_release_tools/assets/hooks/**/*.py"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = false
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+    "@overload",
+    "raise NotImplementedError",
+]
+
+[tool.tox]
+requires = ["tox>=4", "tox-uv>=1"]
+env_list = ["3.12", "3.13", "3.14"]
+skip_missing_interpreters = true
+
+[tool.tox.env_run_base]
+dependency_groups = ["dev"]
+commands = [["pytest", "-q", "-m", "not runtime", "{posargs}"]]

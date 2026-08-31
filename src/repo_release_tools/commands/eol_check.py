@@ -1,0 +1,476 @@
+"""Check detected runtimes and project minimum versions against end-of-life policy.
+
+## Overview
+
+`rrt eol` helps you answer two questions for one or more languages:
+
+- Is the current host runtime still supported?
+- Is the repository's declared minimum version still supported?
+
+It is designed for release pipelines and maintenance workflows where runtime
+support windows matter.
+
+## What the command checks
+
+For each requested language, the command checks:
+
+- the host runtime detected on the current machine
+- the project minimum version detected from the repository
+
+Each version is compared against EOL records and classified as:
+
+- supported
+- expiring soon
+- end-of-life
+- unknown
+
+When the runtime cannot be detected, the command prints `not detected` instead
+of failing that check.
+
+## Data sources
+
+By default, rrt uses bundled EOL data. With `--fetch-live`, it refreshes the
+records from endoflife.date for the current run.
+
+Language selection comes from the resolved configuration when available. If no
+EOL config is present, the command defaults to Python.
+
+## Policy behavior
+
+The effective thresholds come from `[tool.rrt.eol]` when configured, with CLI
+flags applied on top for the current invocation.
+
+Important policy switches:
+
+- `--warn-days` sets the warning window
+- `--error-days` sets the failure window
+- `--allow-eol` downgrades EOL failures to warnings
+- `--language` limits the check to one language
+
+## Output
+
+The command prints a small summary first, then one section per language with
+host runtime and project minimum results. If all checks pass it ends with a
+success line; otherwise it prints a failure line and returns a non-zero exit
+code.
+
+## Examples
+
+```bash
+rrt eol
+rrt eol --language node --fetch-live
+rrt eol --warn-days 90 --error-days 30
+```
+
+## Caveats
+
+- Supported languages are limited to the values exposed by rrt's EOL helpers.
+- Configured EOL overrides apply per language and version cycle.
+- `--allow-eol` changes exit-code behavior, not the underlying status labels.
+"""
+
+from __future__ import annotations
+
+import argparse
+from dataclasses import dataclass
+from datetime import date
+from pathlib import Path
+
+from repo_release_tools.commands._registry import CommandCategory, CommandGroup, register_command
+from repo_release_tools.config import (
+    EolConfig,
+    EolOverride,
+    find_repo_root,
+    load_or_autodetect_config,
+)
+from repo_release_tools.eol import (
+    SUPPORTED_LANGUAGES,
+    EolRecord,
+    EolStatus,
+    check_eol_status,
+    detect_host_version,
+    detect_project_minimum,
+    get_eol_records,
+    resolve_override_eol,
+)
+from repo_release_tools.state import health_lock_path, upsert_health_lock_checks
+from repo_release_tools.ui import VerbosePrinter
+
+EOL_EPILOG = (
+    "  $ rrt eol\n"
+    "  $ rrt eol --language node --fetch-live\n"
+    "  $ rrt eol --warn-days 90 --error-days 30"
+)
+
+
+def _attach_eol_args(parser: argparse.ArgumentParser) -> None:
+    """Attach the common eol CLI flags to *parser*.
+
+    This is used so both `rrt eol` and `rrt eol check` accept the same options.
+    """
+    parser.add_argument(
+        "--language",
+        metavar="LANG",
+        default=None,
+        help=(
+            "Check one language only "
+            f"({', '.join(sorted(SUPPORTED_LANGUAGES))}). Default: from config or python."
+        ),
+    )
+    parser.add_argument(
+        "--fetch-live",
+        action="store_true",
+        default=False,
+        dest="fetch_live",
+        help="Fetch fresh EOL data from endoflife.date instead of using bundled snapshot.",
+    )
+    parser.add_argument(
+        "--warn-days",
+        type=int,
+        default=None,
+        dest="warn_days",
+        metavar="N",
+        help="Warn when EOL is within N days (default: 180 or from config).",
+    )
+    parser.add_argument(
+        "--error-days",
+        type=int,
+        default=None,
+        dest="error_days",
+        metavar="N",
+        help=("Error when EOL is within N days (default: 0 or from config = only on actual EOL)."),
+    )
+    parser.add_argument(
+        "--allow-eol",
+        action="store_true",
+        default=False,
+        dest="allow_eol",
+        help="Downgrade errors to warnings (useful during migration grace periods).",
+    )
+
+    # More specific checks: allow running only host or only project checks.
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(
+        "--host-only",
+        action="store_true",
+        default=False,
+        dest="host_only",
+        help="Only check the host runtime; skip project minimum checks.",
+    )
+    group.add_argument(
+        "--project-only",
+        action="store_true",
+        default=False,
+        dest="project_only",
+        help="Only check the project minimum version; skip host runtime checks.",
+    )
+
+
+def _override_for(
+    language: str,
+    version: str,
+    overrides: tuple[EolOverride, ...],
+) -> date | None:
+    """Return a configured EOL date override for (language, cycle), or None."""
+    return resolve_override_eol(language, version, overrides)
+
+
+def _int_override(value: int | None, fallback: int) -> int:
+    """Return the explicit CLI value when provided, otherwise the fallback."""
+    return fallback if value is None else value
+
+
+def _status_label(status: EolStatus) -> str:
+    """Return a short human label for an EolStatus."""
+    return {
+        "ok": "supported",
+        "info": "supported",
+        "warn": "expiring soon",
+        "error": "end-of-life",
+        "unknown": "unknown",
+    }.get(status, status)
+
+
+def _emit_check(
+    p: VerbosePrinter,
+    label: str,
+    version: str | None,
+    status: EolStatus,
+    record: EolRecord | None,
+) -> None:
+    """Emit a single EOL check line using the VerbosePrinter."""
+    if version is None:
+        p.warn(f"  {label}: not detected")
+        return
+
+    detail = ""
+    if record is not None:
+        if record.is_eol:
+            detail = " (EOL)"
+        elif record.eol_date is not None:
+            detail = f" (EOL {record.eol_date})"
+        elif record.days_until_eol is not None:
+            detail = f" (EOL in {record.days_until_eol}d)"
+
+    msg = f"  {label}: {version} — {_status_label(status)}{detail}"
+    if status in ("ok", "info"):
+        p.line(msg, ok=True)
+    elif status in ("warn", "unknown"):
+        p.warn(msg)
+    else:
+        p.line(msg, ok=False)
+
+
+def run_eol_checks(
+    languages: tuple[str, ...],
+    root: Path,
+    *,
+    warn_days: int,
+    error_days: int,
+    fetch_live: bool,
+    allow_eol: bool,
+    overrides: tuple[EolOverride, ...],
+    p: VerbosePrinter,
+    today: date | None = None,
+    host_only: bool = False,
+    project_only: bool = False,
+) -> tuple[bool, list[dict[str, str]]]:
+    """Run EOL checks for all requested languages.
+
+    Returns ``(all_ok, check_entries)`` where *check_entries* is a list of
+    health-lock-compatible dicts with ``name``, ``status``, and ``message``.
+    """
+    all_ok = True
+    check_entries: list[dict[str, str]] = []
+
+    for language in languages:
+        p.section(f"EOL check: {language}")
+        records = get_eol_records(language, fetch_live=fetch_live, today=today)
+
+        # Host runtime (skip when project-only requested)
+        host_ver: str | None = None
+        host_status: EolStatus = "unknown"
+        host_record: EolRecord | None = None
+        if not project_only:
+            host_ver = detect_host_version(language)
+            if host_ver is not None:
+                override = _override_for(language, host_ver, overrides)
+                host_status, host_record = check_eol_status(
+                    host_ver,
+                    records,
+                    language=language,
+                    warn_days=warn_days,
+                    error_days=error_days,
+                    allow_eol=allow_eol,
+                    override_eol=override,
+                    today=today,
+                )
+            else:
+                host_status, host_record = "unknown", None
+            _emit_check(p, "Host runtime", host_ver, host_status, host_record)
+            if host_status == "error":
+                all_ok = False
+            check_entries.append(
+                {
+                    "name": f"eol.{language}.host",
+                    "status": "ok"
+                    if host_status in ("ok", "info")
+                    else ("warning" if host_status in ("warn", "unknown") else "error"),
+                    "message": f"{language} host {host_ver or 'not detected'} — {_status_label(host_status)}",
+                }
+            )
+
+        # Project minimum (skip when host-only requested)
+        proj_ver: str | None = None
+        proj_status: EolStatus = "unknown"
+        proj_record: EolRecord | None = None
+        if not host_only:
+            proj_ver = detect_project_minimum(language, root)
+            if proj_ver is not None:
+                override = _override_for(language, proj_ver, overrides)
+                proj_status, proj_record = check_eol_status(
+                    proj_ver,
+                    records,
+                    language=language,
+                    warn_days=warn_days,
+                    error_days=error_days,
+                    allow_eol=allow_eol,
+                    override_eol=override,
+                    today=today,
+                )
+            else:
+                proj_status, proj_record = "unknown", None
+            _emit_check(p, "Project minimum", proj_ver, proj_status, proj_record)
+            if proj_status == "error":
+                all_ok = False
+            check_entries.append(
+                {
+                    "name": f"eol.{language}.minimum",
+                    "status": "ok"
+                    if proj_status in ("ok", "info")
+                    else ("warning" if proj_status in ("warn", "unknown") else "error"),
+                    "message": f"{language} minimum {proj_ver or 'not detected'} — {_status_label(proj_status)}",
+                }
+            )
+
+        p.blank_line()
+
+    return all_ok, check_entries
+
+
+@dataclass(frozen=True)
+class Options:
+    """Typed view of ``argparse.Namespace`` for ``rrt eol``.
+
+    Built once via :meth:`from_args` at the top of :func:`cmd_eol` so every
+    flag has a single, typed read site instead of scattered
+    ``getattr(args, ..., default)`` calls throughout the function body.
+    """
+
+    verbose: int
+    language: str | None
+    fetch_live: bool
+    warn_days: int | None
+    error_days: int | None
+    allow_eol: bool
+    host_only: bool
+    project_only: bool
+    snapshot: bool
+
+    @classmethod
+    def from_args(cls, args: argparse.Namespace) -> Options:
+        """Build an :class:`Options` from a parsed ``argparse.Namespace``.
+
+        Every flag below is given a real default by ``_attach_eol_args`` /
+        ``register()`` (or, for ``--verbose``, by cli.py's global parser), so
+        a Namespace produced by argparse's own ``rrt eol`` parser always
+        carries every attribute. The getattr fallbacks here absorb two other
+        real callers: unit tests in tests/commands/test_eol_check.py that
+        construct sparse ``argparse.Namespace`` objects by hand, and
+        workflow/hooks.py's ``check-eol`` dispatch case, which registers a
+        bare ``subparsers.add_parser("check-eol")`` with none of these flags
+        and only sets ``parsed.verbose`` before calling ``cmd_eol_check`` —
+        every other field must default exactly as it does today (``None`` /
+        ``False``) for that hook invocation to behave unchanged.
+        """
+        return cls(
+            verbose=getattr(args, "verbose", 0) or 0,
+            language=getattr(args, "language", None),
+            fetch_live=getattr(args, "fetch_live", False),
+            warn_days=getattr(args, "warn_days", None),
+            error_days=getattr(args, "error_days", None),
+            allow_eol=getattr(args, "allow_eol", False),
+            host_only=getattr(args, "host_only", False),
+            project_only=getattr(args, "project_only", False),
+            snapshot=getattr(args, "snapshot", False),
+        )
+
+
+def cmd_eol(args: argparse.Namespace) -> int:
+    """Check host runtimes and project minimums against EOL dates."""
+    opts = Options.from_args(args)
+    root = find_repo_root(Path.cwd())
+    p = VerbosePrinter(verbose=opts.verbose)
+
+    # Determine effective config: CLI flags override config-file values
+    eol_cfg: EolConfig | None = None
+    try:
+        rrt_config = load_or_autodetect_config(root)
+        eol_cfg = rrt_config.eol
+    except (FileNotFoundError, ValueError, RuntimeError):
+        pass  # No rrt config found — fall through to CLI defaults
+
+    if eol_cfg is not None:
+        # Merge: CLI flags take priority over config-file values
+        warn_days = _int_override(opts.warn_days, eol_cfg.warn_days)
+        error_days = _int_override(opts.error_days, eol_cfg.error_days)
+        fetch_live: bool = opts.fetch_live or eol_cfg.fetch_live
+        allow_eol: bool = opts.allow_eol or eol_cfg.allow_eol
+        overrides = eol_cfg.overrides
+        languages: tuple[str, ...] = (opts.language,) if opts.language else eol_cfg.languages
+    else:
+        warn_days = _int_override(opts.warn_days, 180)
+        error_days = _int_override(opts.error_days, 0)
+        fetch_live = opts.fetch_live
+        allow_eol = opts.allow_eol
+        overrides = ()
+        languages = (opts.language,) if opts.language else ("python",)
+
+    p.ok("rrt eol")
+    p.action(f"Languages: {', '.join(languages)}")
+    p.action(f"Warn threshold: {warn_days}d  Error threshold: {error_days}d")
+    if fetch_live:
+        p.action("Fetching live data from endoflife.date …")
+    p.verbose_line(f"eol: {root}", level=1)
+    p.verbose_line(f"  languages: {', '.join(languages)}", level=2)
+    p.verbose_line(f"  warn_days={warn_days} error_days={error_days}", level=2)
+    p.blank_line()
+
+    all_ok, check_entries = run_eol_checks(
+        languages=languages,
+        root=root,
+        warn_days=warn_days,
+        error_days=error_days,
+        fetch_live=fetch_live,
+        allow_eol=allow_eol,
+        overrides=overrides,
+        p=p,
+        host_only=opts.host_only,
+        project_only=opts.project_only,
+    )
+
+    if opts.snapshot:
+        upsert_health_lock_checks(health_lock_path(root), check_entries)
+        p.ok(f"EOL results merged into .rrt/health.lock.toml ({len(check_entries)} checks)")
+
+    if all_ok:
+        p.ok("All EOL checks passed.")
+        return 0
+
+    if allow_eol:
+        p.warn("EOL issues found but allow_eol=true — treating as warning only.")
+        return 0
+
+    p.line("One or more EOL checks failed.", ok=False)
+    return 1
+
+
+@register_command(name="eol", category=CommandCategory.READ, group=CommandGroup.REPO_HEALTH)
+def register(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    """Register the eol command."""
+    parser = subparsers.add_parser(
+        "eol",
+        help="Check host runtimes and project minimums against EOL dates.",
+        description=(
+            "Check detected host runtimes and project minimum versions against end-of-life "
+            "dates.\n\n"
+            "Uses bundled EOL data by default and can refresh from endoflife.date on demand. "
+            "When [tool.rrt.eol] is configured, CLI flags override the configured thresholds "
+            "for this invocation."
+        ),
+        epilog=EOL_EPILOG,
+    )
+    # Attach common args to the top-level `rrt eol` and also provide a
+    # `rrt eol check` sub-action for parity with other commands.
+    _attach_eol_args(parser)
+    parser.add_argument(
+        "--snapshot",
+        action="store_true",
+        default=False,
+        help="Merge EOL check results into .rrt/health.lock.toml after running.",
+    )
+
+    sub = parser.add_subparsers(dest="eol_action")
+    chk_p = sub.add_parser(
+        "check",
+        help="Exit non-zero when any EOL check fails.",
+        description=(
+            "Run the configured EOL checks for the current repository and exit "
+            "non-zero when any failure is detected."
+        ),
+        epilog=EOL_EPILOG,
+    )
+    _attach_eol_args(chk_p)
+    chk_p.set_defaults(handler=cmd_eol)
+
+    parser.set_defaults(handler=cmd_eol)

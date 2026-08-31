@@ -1,0 +1,15 @@
+[meta]
+generated_at = "2026-07-12T07:12:11+00:00"
+rrt_version = "1.12.0"
+
+[sources."src/repo_release_tools/integrations/action.py"]
+hash = "sha256:75c0b8d04eeb7213da49c368e41ca7621590c21b958cbbe14fba7d0cbf41ac7a"
+symbols = ["GITHUB_ACTION_DOC", "GITHUB_ACTION_PUBLISH_SNAPSHOT_DOC"]
+lang = "python"
+updated_at = "2026-07-12T07:12:11+00:00"
+
+[sources."src/repo_release_tools/workflow/hooks.py"]
+hash = "sha256:68d00b9af5cfea51bdadccfccec31b3f35bf9b7694d6224d4f213c52b541aa3b"
+symbols = ["PRE_COMMIT_DOC", "AGENT_INSTRUCTIONS_DOC"]
+lang = "python"
+updated_at = "2026-07-12T07:12:11+00:00"

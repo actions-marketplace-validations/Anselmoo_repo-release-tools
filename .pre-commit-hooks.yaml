@@ -18,6 +18,16 @@
   stages: [pre-commit]
   minimum_pre_commit_version: "3.2.0"
 
+- id: rrt-update-unreleased
+  name: repo-release-tools update unreleased changelog
+  description: Auto-append conventional commit bullets to the [Unreleased] section
+  entry: rrt-hooks update-unreleased
+  language: python
+  pass_filenames: false
+  always_run: true
+  stages: [commit-msg]
+  minimum_pre_commit_version: "3.2.0"
+
 - id: rrt-commit-subject
   name: repo-release-tools commit subject
   description: Validate commit subjects against Conventional Commits
@@ -35,4 +45,240 @@
   pass_filenames: false
   always_run: true
   stages: [manual, pre-push]
+  minimum_pre_commit_version: "3.2.0"
+
+- id: rrt-doctor
+  name: repo-release-tools doctor
+  description: Health-check core automation wiring for the resolved rrt configuration
+  entry: rrt-hooks doctor
+  language: python
+  pass_filenames: false
+  always_run: true
+  stages: [manual]
+  minimum_pre_commit_version: "3.2.0"
+
+- id: rrt-release-check
+  name: repo-release-tools release check
+  description: Validate version targets, pin targets, and changelog files in rrt config
+  entry: rrt-hooks release-check
+  language: python
+  pass_filenames: false
+  always_run: true
+  stages: [manual]
+  minimum_pre_commit_version: "3.2.0"
+
+- id: rrt-eol-check
+  name: repo-release-tools EOL check
+  description: Check host runtimes and declared project minimums against end-of-life dates
+  entry: rrt-hooks check-eol
+  language: python
+  pass_filenames: false
+  always_run: true
+  stages: [pre-push]
+  minimum_pre_commit_version: "3.2.0"
+
+- id: rrt-docs-check
+  name: repo-release-tools docs consistency check
+  description: >-
+    Fail if source-owned docs are stale — catches source files added, modified,
+    or deleted without regenerating .rrt/docs.lock.toml
+  entry: rrt-hooks check-docs
+  language: python
+  pass_filenames: false
+  always_run: true
+  stages: [pre-commit]
+  minimum_pre_commit_version: "3.2.0"
+
+- id: rrt-docs-lock
+  name: repo-release-tools docs lock
+  description: Regenerate the source-owned docs lockfile (.rrt/docs.lock.toml)
+  entry: rrt-hooks docs-generate
+  language: python
+  pass_filenames: false
+  always_run: true
+  stages: [manual]
+  minimum_pre_commit_version: "3.2.0"
+
+- id: rrt-docs-publish
+  name: repo-release-tools docs publish
+  description: Regenerate CLI reference documentation and topic pages
+  entry: rrt-hooks docs-publish
+  language: python
+  pass_filenames: false
+  always_run: true
+  stages: [manual]
+  minimum_pre_commit_version: "3.2.0"
+
+- id: rrt-docs-inject
+  name: repo-release-tools docs inject
+  description: Synchronize shared anchor blocks (headers/footers) across documentation
+  entry: rrt-hooks docs-inject
+  language: python
+  pass_filenames: false
+  always_run: true
+  stages: [manual]
+  minimum_pre_commit_version: "3.2.0"
+
+- id: rrt-docs-map-update
+  name: repo-release-tools docs map update
+  description: >-
+    Regenerate per-directory purpose docs (README.md or configured file name)
+    via `rrt docs map` and refresh the lockfile at .rrt/docs_map.lock.toml.
+  entry: rrt-hooks docs-map-update
+  language: python
+  pass_filenames: false
+  always_run: true
+  stages: [pre-commit]
+  minimum_pre_commit_version: "3.2.0"
+
+- id: rrt-docs-map-check
+  name: repo-release-tools docs map check
+  description: >-
+    Fail in CI when any per-directory purpose doc disagrees with
+    .rrt/docs_map.lock.toml. Run `rrt docs map` locally to refresh.
+  entry: rrt-hooks docs-map-check
+  language: python
+  pass_filenames: false
+  always_run: true
+  stages: [manual]
+  minimum_pre_commit_version: "3.2.0"
+
+- id: rrt-docstring-suggest
+  name: repo-release-tools docstring suggest
+  description: Apply scaffolded docstrings to missing or thin module docstrings
+  entry: rrt-hooks docstring-suggest
+  language: python
+  pass_filenames: false
+  always_run: true
+  stages: [manual]
+  minimum_pre_commit_version: "3.2.0"
+
+- id: rrt-folder-check
+  name: repo-release-tools folder check
+  description: Validate repository folder structure against [tool.rrt.folders] configuration
+  entry: rrt-hooks folder-check
+  language: python
+  pass_filenames: false
+  always_run: true
+  stages: [pre-commit, pre-push]
+  minimum_pre_commit_version: "3.2.0"
+
+- id: rrt-artifacts-generate
+  name: repo-release-tools artifacts generate
+  description: Run per-target generation commands and snapshot hashes to .rrt/artifacts.lock.toml
+  entry: rrt-hooks artifacts-generate
+  language: python
+  pass_filenames: false
+  always_run: true
+  stages: [pre-commit]
+  minimum_pre_commit_version: "3.2.0"
+
+- id: rrt-artifacts-check
+  name: repo-release-tools artifacts check
+  description: Verify generated artifact hashes match the committed .rrt/artifacts.lock.toml
+  entry: rrt-hooks artifacts-check
+  language: python
+  pass_filenames: false
+  always_run: true
+  stages: [manual]
+  minimum_pre_commit_version: "3.2.0"
+
+- id: rrt-artifacts-snapshot
+  name: repo-release-tools artifacts snapshot
+  description: Snapshot artifact hashes without running generation commands
+  entry: rrt-hooks artifacts-snapshot
+  language: python
+  pass_filenames: false
+  always_run: true
+  stages: [manual]
+  minimum_pre_commit_version: "3.2.0"
+
+- id: rrt-tree-check
+  name: repo-release-tools tree check
+  description: Validate project tree structure against the committed .rrt/tree.lock.toml
+  entry: rrt-hooks tree-check
+  language: python
+  pass_filenames: false
+  always_run: true
+  stages: [pre-push]
+  minimum_pre_commit_version: "3.2.0"
+
+- id: rrt-drift-check
+  name: repo-release-tools drift check
+  description: Verify agent-facing surfaces match the committed .rrt/drift.lock.toml
+  entry: rrt-hooks drift-check
+  language: python
+  pass_filenames: false
+  always_run: true
+  stages: [pre-push]
+  minimum_pre_commit_version: "3.2.0"
+
+- id: rrt-changelog-postcorrect
+  name: repo-release-tools changelog post-correct
+  description: Consolidate fragmented changelog entries after a squash merge
+  entry: rrt-hooks changelog post-correct
+  language: python
+  pass_filenames: false
+  always_run: true
+  stages: [manual]
+  minimum_pre_commit_version: "3.2.0"
+
+- id: rrt-sync
+  name: repo-release-tools upstream sync
+  description: List upstream releases newer than the current version
+  entry: rrt-hooks sync
+  language: python
+  pass_filenames: false
+  always_run: true
+  stages: [manual]
+  minimum_pre_commit_version: "3.2.0"
+
+- id: rrt-publish-snapshot
+  name: repo-release-tools publish snapshot
+  description: Force-push a single-commit snapshot of tracked content to a secondary remote
+  entry: rrt-hooks publish-snapshot
+  language: python
+  pass_filenames: false
+  always_run: true
+  stages: [manual]
+  minimum_pre_commit_version: "3.2.0"
+
+- id: rrt-config-validate
+  name: repo-release-tools config validate
+  description: Validate [tool.rrt] config — version targets, pin targets, and structure
+  entry: rrt-hooks config-validate
+  language: python
+  pass_filenames: false
+  always_run: true
+  stages: [pre-commit, pre-push]
+  minimum_pre_commit_version: "3.2.0"
+
+- id: rrt-config-reference-check
+  name: repo-release-tools config reference check
+  description: Fail when docs/rrt-config-reference.toml is stale versus the current schema
+  entry: rrt-hooks config-reference-check
+  language: python
+  pass_filenames: false
+  always_run: true
+  stages: [manual]
+  minimum_pre_commit_version: "3.2.0"
+
+- id: rrt-changelog-lint
+  name: repo-release-tools changelog lint
+  description: Enforce changelog entry style (sentence case, length, no duplicates)
+  entry: rrt-hooks changelog-lint
+  language: python
+  pass_filenames: false
+  always_run: true
+  stages: [pre-commit]
+  minimum_pre_commit_version: "3.2.0"
+
+- id: rrt-tag-check
+  name: repo-release-tools tag check
+  description: Validate existing git tags follow the configured naming convention
+  entry: rrt-hooks tag-check
+  language: python
+  pass_filenames: false
+  always_run: true
+  stages: [pre-push]
   minimum_pre_commit_version: "3.2.0"

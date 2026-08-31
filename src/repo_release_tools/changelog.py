@@ -4,17 +4,29 @@ from __future__ import annotations
 
 import datetime as dt
 import re
-
 from dataclasses import dataclass
+from enum import Enum
+from pathlib import Path
 
 
-CONVENTIONAL_COMMIT_RE = re.compile(
-    r"^(?P<type>feat|fix|docs|style|refactor|perf|test|build|ci|chore|deps)"
-    r"(?:\((?P<scope>[^)]+)\))?"
-    r"(?P<breaking>!)?"
-    r"\s*:\s*(?P<desc>.+)$",
-    re.IGNORECASE,
-)
+def _build_commit_re(extra_types: tuple[str, ...] = ()) -> re.Pattern[str]:
+    """Build the conventional commit regex, optionally extending with extra types."""
+    base_types = "feat|fix|docs|style|refactor|perf|test|build|ci|chore|deps"
+    if extra_types:
+        joined = "|".join(re.escape(t) for t in extra_types)
+        type_pattern = f"{base_types}|{joined}"
+    else:
+        type_pattern = base_types
+    return re.compile(
+        rf"^(?P<type>{type_pattern})"
+        r"(?:\((?P<scope>[^)]+)\))?"
+        r"(?P<breaking>!)?"
+        r"\s*:\s*(?P<desc>.+)$",
+        re.IGNORECASE,
+    )
+
+
+CONVENTIONAL_COMMIT_RE = _build_commit_re()
 
 SECTION_MAP = {
     "feat": "Added",
@@ -50,11 +62,18 @@ class ParsedCommit:
     breaking: bool = False
 
 
-def parse_conventional_commit(subject: str) -> ParsedCommit | None:
-    """Parse a commit subject."""
+def parse_conventional_commit(
+    subject: str,
+    extra_types: tuple[str, ...] = (),
+) -> ParsedCommit | None:
+    """Parse a commit subject.
+
+    *extra_types* allows project-specific types beyond the standard set.
+    """
     if subject.startswith("Merge ") or subject.lower().startswith("release:"):
         return None
-    match = CONVENTIONAL_COMMIT_RE.match(subject)
+    regex = _build_commit_re(extra_types) if extra_types else CONVENTIONAL_COMMIT_RE
+    match = regex.match(subject)
     if match is None:
         return None
     return ParsedCommit(
@@ -65,13 +84,101 @@ def parse_conventional_commit(subject: str) -> ParsedCommit | None:
     )
 
 
+# ---------------------------------------------------------------------------
+# Changelog format
+# ---------------------------------------------------------------------------
+
+
+class ChangelogFormat(str, Enum):
+    """Supported changelog file formats.
+
+    * ``MARKDOWN`` — standard ``##``/``###`` heading notation (``.md``).
+    * ``RST`` — reStructuredText underline notation (``.rst``, ``.txt``).
+    """
+
+    MARKDOWN = "markdown"
+    RST = "rst"
+
+
+def detect_changelog_format(path: Path | str) -> ChangelogFormat:
+    """Infer the changelog format from the file extension.
+
+    Returns ``ChangelogFormat.RST`` for ``.rst`` and ``.txt`` files because
+    both formats use plain-text underline notation.  Returns
+    ``ChangelogFormat.MARKDOWN`` for everything else (including ``.md`` and
+    extension-less names such as ``CHANGELOG``).
+    """
+    suffix = Path(path).suffix.lower()
+    if suffix in (".rst", ".txt"):
+        return ChangelogFormat.RST
+    return ChangelogFormat.MARKDOWN
+
+
+# ---------------------------------------------------------------------------
+# Markdown patterns and constants
+# ---------------------------------------------------------------------------
+
+# Matches the top-level "## [Unreleased]" header (case-insensitive).
+_UNRELEASED_HEADER_RE = re.compile(r"^## \[Unreleased\]\s*$", re.IGNORECASE | re.MULTILINE)
+# Matches any "## [version]" or "## [Unreleased]" header used as a section boundary.
+_SECTION_HEADER_RE = re.compile(r"^## \[", re.MULTILINE)
+# Captures the version label inside any "## [LABEL] ..." header line.
+_MD_RELEASE_HEADER_RE = re.compile(r"^## \[([^\]]+)\][^\n]*$", re.MULTILINE)
+# Matches a leading "# Changelog" or "# CHANGELOG" title line.
+_CHANGELOG_TITLE_RE = re.compile(r"^# .+\n", re.MULTILINE)
+
+UNRELEASED_PLACEHOLDER = "## [Unreleased]\n"
+
+# ---------------------------------------------------------------------------
+# RST patterns and constants
+# ---------------------------------------------------------------------------
+
+# Underline characters for each heading level in generated RST changelogs.
+_RST_SECTION_CHAR = "-"  # version / Unreleased level  (## in Markdown)
+_RST_SUBSECTION_CHAR = "~"  # sub-section level           (### in Markdown)
+
+# "Unreleased" or "[Unreleased]" heading followed immediately by a dash underline.
+# The optional trailing \n? is consumed so that m.end() lands after the underline line.
+# Requires 3+ dashes anchored to end-of-line to avoid matching bullet points ("- text").
+_RST_UNRELEASED_HEADER_RE = re.compile(
+    r"^(?:\[Unreleased\]|Unreleased) *\n-{3,}$\n?",
+    re.IGNORECASE | re.MULTILINE,
+)
+# Any section at the version/unreleased level: text line + dash underline (3+ dashes,
+# end-of-line anchored so that bullet points starting with "- " don't match).
+_RST_SECTION_BOUNDARY_RE = re.compile(r"^\S[^\n]*\n-{3,}$\n?", re.MULTILINE)
+# Captures the label of any RST section header (text line + dash underline).
+_RST_RELEASE_HEADER_RE = re.compile(r"^(\S[^\n]*)\n-{3,}$\n?", re.MULTILINE)
+# Document title: text line + equals underline (3+ chars, end-of-line anchored).
+_RST_TITLE_RE = re.compile(r"^.+\n={3,}$\n?", re.MULTILINE)
+
+# "Unreleased\n----------\n"
+RST_UNRELEASED_PLACEHOLDER = f"Unreleased\n{_RST_SECTION_CHAR * len('Unreleased')}\n"
+
+
+def _rst_heading(text: str, underline_char: str) -> str:
+    """Render *text* as an RST heading with the given *underline_char*."""
+    return f"{text}\n{underline_char * max(len(text), 3)}\n"
+
+
+# ---------------------------------------------------------------------------
+# build_changelog_section
+# ---------------------------------------------------------------------------
+
+
 def build_changelog_section(
     version: str,
     commit_subjects: list[str],
     *,
     include_maintenance: bool,
+    fmt: ChangelogFormat = ChangelogFormat.MARKDOWN,
 ) -> str:
-    """Render a Keep-a-Changelog style section."""
+    r"""Render a Keep-a-Changelog style section.
+
+    The *fmt* parameter controls whether Markdown (``## [version]``,
+    ``### Sub``) or RST underline (``version - date\\n---``, ``Sub\\n~~~``)
+    notation is used.
+    """
     sections: dict[str, list[str]] = {section: [] for section in SECTION_ORDER}
 
     for subject in commit_subjects:
@@ -85,7 +192,12 @@ def build_changelog_section(
         sections[section].append(f"- {scope_part}{parsed.description}")
 
     today = dt.datetime.now(dt.UTC).date().isoformat()
-    lines = [f"## [{version}] - {today}", ""]
+    if fmt == ChangelogFormat.RST:
+        version_text = f"{version} - {today}"
+        lines: list[str] = [version_text, _RST_SECTION_CHAR * max(len(version_text), 3), ""]
+    else:
+        lines = [f"## [{version}] - {today}", ""]
+
     rendered_any = False
     for section_name in SECTION_ORDER:
         entries = sections[section_name]
@@ -93,7 +205,11 @@ def build_changelog_section(
             continue
         if section_name == "Maintenance" and not include_maintenance:
             continue
-        lines.append(f"### {section_name}")
+        if fmt == ChangelogFormat.RST:
+            lines.append(section_name)
+            lines.append(_RST_SUBSECTION_CHAR * max(len(section_name), 3))
+        else:
+            lines.append(f"### {section_name}")
         lines.extend(entries)
         lines.append("")
         rendered_any = True
@@ -101,3 +217,394 @@ def build_changelog_section(
     if not rendered_any:
         lines.extend(["_No notable changes recorded._", ""])
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# [Unreleased] section helpers
+# ---------------------------------------------------------------------------
+
+
+def has_unreleased_section(
+    content: str,
+    fmt: ChangelogFormat = ChangelogFormat.MARKDOWN,
+) -> bool:
+    """Return True if *content* contains an ``[Unreleased]`` / ``Unreleased`` header."""
+    if fmt == ChangelogFormat.RST:
+        return bool(_RST_UNRELEASED_HEADER_RE.search(content))
+    return bool(_UNRELEASED_HEADER_RE.search(content))
+
+
+def get_unreleased_section_body(
+    content: str,
+    fmt: ChangelogFormat = ChangelogFormat.MARKDOWN,
+) -> str:
+    """Return the text block under the ``[Unreleased]`` section (header line excluded).
+
+    Returns an empty string when no ``[Unreleased]`` section exists.
+    The returned text is stripped of leading and trailing whitespace.
+    """
+    if fmt == ChangelogFormat.RST:
+        m = _RST_UNRELEASED_HEADER_RE.search(content)
+        if not m:
+            return ""
+        section_start = m.end()
+        next_section = _RST_SECTION_BOUNDARY_RE.search(content, section_start)
+    else:
+        m = _UNRELEASED_HEADER_RE.search(content)
+        if not m:
+            return ""
+        section_start = m.end()
+        next_section = _SECTION_HEADER_RE.search(content, section_start)
+
+    body = content[section_start : next_section.start() if next_section else len(content)]
+    return body.strip()
+
+
+def get_unreleased_entries(
+    content: str,
+    fmt: ChangelogFormat = ChangelogFormat.MARKDOWN,
+) -> list[str]:
+    """Return bullet lines that exist under the ``[Unreleased]`` / ``Unreleased`` section.
+
+    Returns an empty list when no ``[Unreleased]`` section is present or when
+    the section contains no bullet items.
+
+    The *fmt* parameter selects Markdown (default) or RST pattern matching.
+    """
+    if fmt == ChangelogFormat.RST:
+        m = _RST_UNRELEASED_HEADER_RE.search(content)
+        if not m:
+            return []
+        section_start = m.end()
+        next_section = _RST_SECTION_BOUNDARY_RE.search(content, section_start)
+    else:
+        m = _UNRELEASED_HEADER_RE.search(content)
+        if not m:
+            return []
+        section_start = m.end()
+        next_section = _SECTION_HEADER_RE.search(content, section_start)
+
+    section_body = content[section_start : next_section.start() if next_section else len(content)]
+    return [line for line in section_body.splitlines() if line.strip().startswith("- ")]
+
+
+def clear_unreleased_section(
+    content: str,
+    fmt: ChangelogFormat = ChangelogFormat.MARKDOWN,
+) -> str:
+    """Remove every entry under ``[Unreleased]``, keeping the header line.
+
+    Used by post-release cleanup tooling (``rrt release repair`` for the
+    ``changelog_unreleased_dirty`` drift case): a forgotten bullet under
+    ``[Unreleased]`` after a bump is wiped without touching the already-
+    promoted versioned section below.
+
+    Returns the content unchanged when no ``[Unreleased]`` header is
+    present. When a versioned section follows the header, a single blank
+    line is left between the header and that next section.
+    """
+    if fmt == ChangelogFormat.RST:
+        m = _RST_UNRELEASED_HEADER_RE.search(content)
+        if not m:
+            return content
+        section_start = m.end()
+        next_section = _RST_SECTION_BOUNDARY_RE.search(content, section_start)
+    else:
+        m = _UNRELEASED_HEADER_RE.search(content)
+        if not m:
+            return content
+        section_start = m.end()
+        next_section = _SECTION_HEADER_RE.search(content, section_start)
+
+    if next_section is None:
+        return content[:section_start].rstrip() + "\n"
+    return content[:section_start].rstrip() + "\n\n" + content[next_section.start() :]
+
+
+# ---------------------------------------------------------------------------
+# Versioned section helpers
+# ---------------------------------------------------------------------------
+
+
+def _normalize_version_label(label: str) -> str:
+    """Normalize a version label for case- and "v"-prefix-insensitive matching."""
+    return label.strip().lower().lstrip("v")
+
+
+def list_versioned_sections(
+    content: str,
+    fmt: ChangelogFormat = ChangelogFormat.MARKDOWN,
+) -> list[str]:
+    """Return labels of every release section in *content* in document order.
+
+    The ``[Unreleased]`` / ``Unreleased`` placeholder is excluded. Labels are
+    returned exactly as written (case and punctuation preserved); only date
+    suffixes such as ``" - 2026-01-01"`` are stripped from the RST form.
+    """
+    if fmt == ChangelogFormat.RST:
+        labels: list[str] = []
+        for match in _RST_RELEASE_HEADER_RE.finditer(content):
+            raw = match.group(1).strip()
+            label = raw.split(" - ", 1)[0].strip().strip("[]")
+            if label.lower() == "unreleased":
+                continue
+            labels.append(label)
+        return labels
+
+    labels = []
+    for match in _MD_RELEASE_HEADER_RE.finditer(content):
+        label = match.group(1).strip()
+        if label.lower() == "unreleased":
+            continue
+        labels.append(label)
+    return labels
+
+
+def get_release_section_body(
+    content: str,
+    version: str,
+    fmt: ChangelogFormat = ChangelogFormat.MARKDOWN,
+) -> str | None:
+    """Return the body of a versioned ``[VERSION]`` section.
+
+    Matching is case-insensitive and ignores a leading ``v`` so callers can
+    pass either ``"1.2.3"`` or ``"v1.2.3"``. Returns ``None`` when no
+    matching section exists. The returned text excludes the header line and
+    is stripped of leading/trailing whitespace.
+    """
+    needle = _normalize_version_label(version)
+
+    if fmt == ChangelogFormat.RST:
+        for match in _RST_RELEASE_HEADER_RE.finditer(content):
+            raw = match.group(1).strip()
+            label = raw.split(" - ", 1)[0].strip().strip("[]")
+            if _normalize_version_label(label) != needle:
+                continue
+            section_start = match.end()
+            next_match = _RST_RELEASE_HEADER_RE.search(content, section_start)
+            end = next_match.start() if next_match else len(content)
+            return content[section_start:end].strip()
+        return None
+
+    for match in _MD_RELEASE_HEADER_RE.finditer(content):
+        label = match.group(1).strip()
+        if _normalize_version_label(label) != needle:
+            continue
+        section_start = match.end()
+        next_match = _SECTION_HEADER_RE.search(content, section_start)
+        end = next_match.start() if next_match else len(content)
+        return content[section_start:end].strip()
+    return None
+
+
+def get_latest_released_version(
+    content: str,
+    fmt: ChangelogFormat = ChangelogFormat.MARKDOWN,
+) -> str | None:
+    """Return the topmost versioned label (excluding ``[Unreleased]``) or ``None``."""
+    labels = list_versioned_sections(content, fmt)
+    return labels[0] if labels else None
+
+
+def append_to_unreleased(
+    content: str,
+    commit_subject: str,
+    fmt: ChangelogFormat = ChangelogFormat.MARKDOWN,
+) -> str:
+    """Insert a parsed bullet from *commit_subject* into the ``[Unreleased]`` section.
+
+    If no ``[Unreleased]`` section exists, one is created at the top of the
+    file (after a title line when present).
+
+    Returns the updated content.  If the commit subject is not a conventional
+    commit subject, or its parsed type is not mapped in ``SECTION_MAP``, the
+    content is returned unchanged.  If the exact bullet is already present in
+    the ``[Unreleased]`` section the content is also returned unchanged.
+
+    The *fmt* parameter selects Markdown (default) or RST underline notation.
+    """
+    parsed = parse_conventional_commit(commit_subject)
+    if parsed is None:
+        return content
+
+    section = "Breaking Changes" if parsed.breaking else SECTION_MAP.get(parsed.type)
+    if section is None:
+        return content
+
+    scope_part = f"**{parsed.scope}**: " if parsed.scope else ""
+    bullet = f"- {scope_part}{parsed.description}"
+
+    if fmt == ChangelogFormat.RST:
+        return _append_to_unreleased_rst(content, section, bullet)
+
+    # --- Markdown ---
+    if has_unreleased_section(content):
+        m = _UNRELEASED_HEADER_RE.search(content)
+        assert m is not None  # guaranteed by has_unreleased_section
+        insert_pos = m.end()
+        section_end_m = _SECTION_HEADER_RE.search(content, insert_pos)
+        section_body_end = section_end_m.start() if section_end_m else len(content)
+        section_body = content[insert_pos:section_body_end]
+
+        # Skip if this exact bullet is already present in the section.
+        if bullet in section_body.splitlines():
+            return content
+
+        sub_header = f"### {section}"
+        if sub_header in section_body:
+            sub_pos = section_body.index(sub_header) + len(sub_header)
+            new_body = section_body[:sub_pos] + f"\n{bullet}" + section_body[sub_pos:]
+        else:
+            stripped = section_body.rstrip("\n")
+            # How many trailing newlines were in the original section body.
+            trailing_n = len(section_body) - len(stripped)
+            # When a version section follows we need at least two newlines
+            # (blank line) as separator.  Without this, stripping the
+            # trailing newlines and adding back only one would abut the
+            # new bullet against the ## [version] header.
+            if section_end_m is not None:
+                trailing_n = max(trailing_n, 2)
+            trailing = "\n" * trailing_n
+            if stripped:
+                # Existing content: append after it with a blank-line gap.
+                # stripped already starts with \n (the blank line after the
+                # [Unreleased] header consumed by \s*$ in the regex).
+                new_body = stripped + f"\n\n### {section}\n{bullet}" + trailing
+            else:
+                # Empty section: one leading \n forms the blank line together
+                # with the \n already at end of content[:insert_pos].
+                new_body = f"\n### {section}\n{bullet}" + trailing
+
+        return content[:insert_pos] + new_body + content[section_body_end:]
+    new_section = f"## [Unreleased]\n\n### {section}\n{bullet}\n"
+    if title_m := _CHANGELOG_TITLE_RE.match(content):
+        insert_pos = title_m.end()
+        remainder = content[insert_pos:]
+        # Avoid a double blank line: if the existing content already starts
+        # with \n (blank line before first version header), don't add one.
+        separator = "" if remainder.startswith("\n") else "\n"
+        return content[:insert_pos] + "\n" + new_section + separator + remainder
+    # No title line: add a separator before any existing content.
+    separator = "\n" if content and not content.startswith("\n") else ""
+    return new_section + separator + content
+
+
+def _append_to_unreleased_rst(content: str, section: str, bullet: str) -> str:
+    """RST-specific implementation for appending a bullet to the Unreleased section."""
+    sub_header_re = re.compile(
+        rf"^{re.escape(section)}\n{re.escape(_RST_SUBSECTION_CHAR)}{{3,}}$",
+        re.MULTILINE,
+    )
+
+    if has_unreleased_section(content, ChangelogFormat.RST):
+        m = _RST_UNRELEASED_HEADER_RE.search(content)
+        assert m is not None  # guaranteed by has_unreleased_section
+        insert_pos = m.end()
+        next_section_m = _RST_SECTION_BOUNDARY_RE.search(content, insert_pos)
+        section_body_end = next_section_m.start() if next_section_m else len(content)
+        section_body = content[insert_pos:section_body_end]
+
+        # Skip if this exact bullet is already present in the section.
+        if bullet in section_body.splitlines():
+            return content
+
+        sub_match = sub_header_re.search(section_body)
+        if sub_match:
+            sub_pos = sub_match.end()
+            new_body = section_body[:sub_pos] + f"\n{bullet}" + section_body[sub_pos:]
+        else:
+            stripped = section_body.rstrip("\n")
+            new_body = stripped + f"\n\n{_rst_heading(section, _RST_SUBSECTION_CHAR)}{bullet}\n"
+
+        return content[:insert_pos] + new_body + content[section_body_end:]
+    new_section = (
+        f"{RST_UNRELEASED_PLACEHOLDER}\n{_rst_heading(section, _RST_SUBSECTION_CHAR)}{bullet}\n\n"
+    )
+    title_m = _RST_TITLE_RE.match(content)
+    if title_m:
+        insert_pos = title_m.end()
+        return content[:insert_pos] + "\n" + new_section + content[insert_pos:]
+    return new_section + content
+
+
+def insert_generated_section(
+    content: str,
+    section: str,
+    fmt: ChangelogFormat = ChangelogFormat.MARKDOWN,
+) -> str:
+    """Insert a generated version *section* into *content*.
+
+    When an (empty) ``[Unreleased]`` section already exists, the generated
+    section is placed *after* that placeholder so the placeholder remains at
+    the top (Keep-a-Changelog convention).  When no ``[Unreleased]`` section
+    is present, a fresh empty placeholder is prepended as a *health-mode*
+    guarantee and the generated section follows it.
+
+    A title line, when present, is always kept at the very top.
+
+    The *fmt* parameter selects Markdown (default) or RST underline notation.
+    """
+    if fmt == ChangelogFormat.RST:
+        unreleased_header_re = _RST_UNRELEASED_HEADER_RE
+        section_boundary_re = _RST_SECTION_BOUNDARY_RE
+        unreleased_placeholder = RST_UNRELEASED_PLACEHOLDER
+        title_re = _RST_TITLE_RE
+    else:
+        unreleased_header_re = _UNRELEASED_HEADER_RE
+        section_boundary_re = _SECTION_HEADER_RE
+        unreleased_placeholder = UNRELEASED_PLACEHOLDER
+        title_re = _CHANGELOG_TITLE_RE
+
+    if has_unreleased_section(content, fmt):
+        m = unreleased_header_re.search(content)
+        assert m is not None  # guaranteed by has_unreleased_section
+        insert_pos = m.end()
+        next_section_m = section_boundary_re.search(content, insert_pos)
+        next_section_pos = next_section_m.start() if next_section_m else len(content)
+        return content[:insert_pos] + "\n" + section + "\n" + content[next_section_pos:]
+    new_content = unreleased_placeholder + "\n" + section + "\n"
+    title_m = title_re.match(content)
+    if title_m:
+        insert_pos = title_m.end()
+        return content[:insert_pos] + "\n" + new_content + content[insert_pos:]
+    return new_content + content
+
+
+def promote_unreleased(
+    content: str,
+    version: str,
+    fmt: ChangelogFormat = ChangelogFormat.MARKDOWN,
+) -> str:
+    """Rename the ``[Unreleased]`` header to ``[version] - YYYY-MM-DD``.
+
+    After promotion an empty ``[Unreleased]`` placeholder is inserted above
+    the newly versioned section so contributors always have a place to add
+    entries.
+
+    Returns the updated content.  If no ``[Unreleased]`` section exists the
+    content is returned unchanged.
+
+    The *fmt* parameter selects Markdown (default) or RST underline notation.
+    """
+    if not has_unreleased_section(content, fmt):
+        return content
+
+    today = dt.datetime.now(dt.UTC).date().isoformat()
+
+    if fmt == ChangelogFormat.RST:
+        m = _RST_UNRELEASED_HEADER_RE.search(content)
+        assert m is not None  # guaranteed by has_unreleased_section
+        versioned_text = f"{version} - {today}"
+        versioned_heading = f"{versioned_text}\n{_RST_SECTION_CHAR * max(len(versioned_text), 3)}"
+        updated = content[: m.start()] + versioned_heading + content[m.end() :]
+        updated = updated.replace(
+            versioned_heading,
+            f"{RST_UNRELEASED_PLACEHOLDER}\n{versioned_heading}",
+            1,
+        )
+        return updated
+
+    versioned_header = f"## [{version}] - {today}"
+    updated = _UNRELEASED_HEADER_RE.sub(versioned_header, content, count=1)
+    updated = updated.replace(versioned_header, f"{UNRELEASED_PLACEHOLDER}\n{versioned_header}", 1)
+    return updated
